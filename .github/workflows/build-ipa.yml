@@ -1,0 +1,73 @@
+name: build-unsigned-ipa
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build unsigned archive
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AuroraPlayer.xcodeproj \
+            -scheme AuroraPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/AuroraPlayer.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            archive
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP="build/AuroraPlayer.xcarchive/Products/Applications/AuroraPlayer.app"
+          if [ ! -d "$APP" ]; then
+            echo "app not found, listing products:"
+            find build/AuroraPlayer.xcarchive/Products -maxdepth 3
+            exit 1
+          fi
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          cd build
+          zip -qry AuroraPlayer-unsigned.ipa Payload
+          ls -lh AuroraPlayer-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuroraPlayer-unsigned-ipa
+          path: build/AuroraPlayer-unsigned.ipa
+          retention-days: 30
+
+      - name: Upload dSYM (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuroraPlayer-dSYM
+          path: build/AuroraPlayer.xcarchive/dSYMs
+          if-no-files-found: ignore
+          retention-days: 7
