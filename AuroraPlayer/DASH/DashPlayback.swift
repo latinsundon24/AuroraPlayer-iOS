@@ -6,8 +6,6 @@ import Foundation
 ///   MPD 解析 → 选码流 → 下载 init/分片 → ClearKey 解密 → 内存 HLS → AVPlayer
 final class DashPlayback {
 
-    enum Kind: String { case video, audio }
-
     enum Failure: LocalizedError {
         case manifest(String)
         case noStream
@@ -185,7 +183,7 @@ final class DashPlayback {
         return (video, audio)
     }
 
-    private func makeStream(kind: Kind,
+    private func makeStream(kind: DASHStream.Kind,
                             doc: MPDDocument,
                             period: MPDPeriod,
                             adaptation: MPDAdaptation,
