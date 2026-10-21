@@ -275,6 +275,12 @@ final class MPDParser: NSObject, XMLParserDelegate {
             currentPeriod = nil
 
         case "AdaptationSet":
+            // ContentProtection 可以写在 AdaptationSet 上，对组内所有 Representation 生效
+            if let adaptation = currentAdaptation {
+                for rep in adaptation.representations where rep.protection.isEmpty {
+                    rep.protection = adaptation.protection
+                }
+            }
             currentAdaptation = nil
             currentRepresentation = nil
 

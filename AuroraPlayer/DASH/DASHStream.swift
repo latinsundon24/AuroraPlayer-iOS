@@ -94,7 +94,12 @@ final class DASHStream {
             let number = template.startNumber + i
             let urlString = expand(template.media ?? "", number: number, time: (template.pto + Double(i) * segDuration))
             guard let url = resolve(urlString) else { continue }
-            out.append(Segment(url: url, duration: segSeconds, time: Double(i) * segSeconds, number: number,
+            // 最后一片常常是残片，按总时长收敛，避免清单总长虚高
+            var actual = segSeconds
+            if duration > 0, i == total - 1 {
+                actual = max(0.001, duration - Double(i) * segSeconds)
+            }
+            out.append(Segment(url: url, duration: actual, time: Double(i) * segSeconds, number: number,
                                key: "n\(number)"))
         }
         return out
