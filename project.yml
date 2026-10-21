@@ -61,6 +61,24 @@ targets:
           - audio
         ITSAppUsesNonExemptEncryption: false
 
+  AuroraPlayerTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Tests
+        excludes:
+          - "Fixtures"
+      - path: Tests/Fixtures
+        buildPhase: resources
+    dependencies:
+      - target: AuroraPlayer
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AuroraPlayer.app/AuroraPlayer"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 schemes:
   AuroraPlayer:
     build:
@@ -68,5 +86,9 @@ schemes:
         AuroraPlayer: all
     run:
       config: Release
+    test:
+      config: Debug
+      targets:
+        - AuroraPlayerTests
     archive:
       config: Release

@@ -23,6 +23,19 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
+      - name: Run unit tests (DASH / ClearKey / playlist)
+        run: |
+          set -o pipefail
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];names=[x['name'] for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone')];print(names[0] if names else 'iPhone 16')")
+          echo "simulator: $DEVICE"
+          xcodebuild test \
+            -project AuroraPlayer.xcodeproj \
+            -scheme AuroraPlayer \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -only-testing:AuroraPlayerTests \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
       - name: Build unsigned archive
         run: |
           set -o pipefail
