@@ -23,6 +23,7 @@ final class AVPlayerEngine: ObservableObject {
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var statusObserver: NSKeyValueObservation?
+    private var failObserver: NSObjectProtocol?
     private var rate: Float = 1.0
     private var dash: DashPlayback?
     /// 用户是否希望播放（DASH 准备完成后据此自动起播）
@@ -47,8 +48,7 @@ final class AVPlayerEngine: ObservableObject {
                 self.duration = d
             }
             if item.status == .failed {
-                let msg = item.error?.localizedDescription ?? "播放失败（格式不支持或网络异常）"
-                if self.errorMessage != msg { self.errorMessage = msg }
+                self.report(item: item)
             }
         }
     }
@@ -58,6 +58,9 @@ final class AVPlayerEngine: ObservableObject {
             player.removeTimeObserver(observer)
         }
         if let observer = endObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = failObserver {
             NotificationCenter.default.removeObserver(observer)
         }
     }
@@ -119,6 +122,10 @@ final class AVPlayerEngine: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
             endObserver = nil
         }
+        if let observer = failObserver {
+            NotificationCenter.default.removeObserver(observer)
+            failObserver = nil
+        }
         statusObserver?.invalidate()
 
         let options: [String: Any]? = headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers]
@@ -133,9 +140,18 @@ final class AVPlayerEngine: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if item.status == .failed {
-                    self.errorMessage = item.error?.localizedDescription ?? "无法播放该流"
+                    self.report(item: item)
                 }
             }
+        }
+
+        failObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, let item = note.object as? AVPlayerItem else { return }
+            self.report(item: item)
         }
 
         endObserver = NotificationCenter.default.addObserver(
@@ -148,6 +164,26 @@ final class AVPlayerEngine: ObservableObject {
     }
 
     // MARK: - 控制
+
+    /// 把 AVFoundation 的原始错误暴露出来，便于定位（例如 ATS 拦截、分片 4xx/5xx）
+    private func report(item: AVPlayerItem) {
+        let ns = item.error as NSError?
+        var detail = ns?.localizedDescription ?? "无法播放该流（格式不支持或网络异常）"
+        if let ns {
+            detail += "［\(ns.domain) \(ns.code)］"
+            if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+                detail += "\n底层错误：\(underlying.domain) \(underlying.code) \(underlying.localizedDescription)"
+            }
+        }
+        if let log = item.errorLog(), !log.events.isEmpty {
+            let events = log.events.suffix(3).map {
+                "status=\($0.errorStatusCode) domain=\($0.errorDomain) uri=\($0.uri ?? "-")"
+            }.joined(separator: " | ")
+            NSLog("[Aurora] AVPlayer errorLog: %@", events)
+        }
+        NSLog("[Aurora] AVPlayerItem failed: %@", String(describing: ns))
+        if errorMessage != detail { errorMessage = detail }
+    }
 
     func play() {
         wantsPlayback = true

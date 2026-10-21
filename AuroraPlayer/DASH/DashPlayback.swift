@@ -75,6 +75,7 @@ final class DashPlayback {
     // MARK: - 生命周期
 
     func start() async throws -> URL {
+        NSLog("[Aurora] DASH manifest: %@", channel.url)
         let response = try await HTTPService.fetch(channel.url, headers: channel.headers)
         // 跟随重定向后，相对地址要以最终 URL 为基准
         if let finalURL = response.finalURL {
@@ -149,6 +150,12 @@ final class DashPlayback {
         guard let url = URL(string: "http://127.0.0.1:\(server.port)/\(token)/master.m3u8") else {
             throw Failure.manifest("本地地址生成失败")
         }
+        NSLog("[Aurora] DASH ready: %@ (live=%@, videoEnc=%@, audioEnc=%@, keys=%d)",
+              url.absoluteString,
+              doc.isDynamic ? "yes" : "no",
+              encryptedVideo ? "yes" : "no",
+              encryptedAudio ? "yes" : "no",
+              keys.count)
         return url
     }
 

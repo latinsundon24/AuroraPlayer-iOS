@@ -38,8 +38,8 @@ targets:
       path: AuroraPlayer/Info.plist
       properties:
         CFBundleDisplayName: 极光播放器
-        CFBundleShortVersionString: "1.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.2"
+        CFBundleVersion: "3"
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
         UIApplicationSceneManifest:
@@ -54,9 +54,11 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
+          # 注意：一旦出现 NSAllowsArbitraryLoadsInWebContent / NSAllowsLocalNetworking /
+          # NSAllowsArbitraryLoadsForMedia，iOS 10+ 会忽略 NSAllowsArbitraryLoads，
+          # 导致 http:// 频道和 127.0.0.1 本地 HLS 都被 ATS 拦截（表现为 CoreMediaErrorDomain）。
+          # 这里只保留全局开关。
           NSAllowsArbitraryLoads: true
-          NSAllowsArbitraryLoadsInWebContent: true
-          NSAllowsLocalNetworking: true
         UIBackgroundModes:
           - audio
         ITSAppUsesNonExemptEncryption: false
