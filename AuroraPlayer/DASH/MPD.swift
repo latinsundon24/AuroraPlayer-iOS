@@ -92,7 +92,6 @@ struct MPDProtection {
         return scheme.contains("clearkey")
             || scheme.contains("e2719d58-a985-b3c9-781a-b030af78d30e")
             || val == "clearkey"
-            || val == "cenc"
     }
 }
 
@@ -108,9 +107,7 @@ final class MPDParser: NSObject, XMLParserDelegate {
     private var currentRepresentation: MPDRepresentation?
 
     private var currentTemplate: MPDSegmentTemplate?
-    private var currentTimelineEntry: MPDTimeline?
     private var currentSegmentList: MPDSegmentList?
-    private var currentProtection: MPDProtection?
     private var textBuffer = ""
 
     static func parse(data: Data) -> MPDDocument? {
@@ -138,26 +135,26 @@ final class MPDParser: NSObject, XMLParserDelegate {
                 document.type = type.lowercased()
             }
             if let value = attributeDict["mediaPresentationDuration"] {
-                document.mediaPresentationDuration = parseDuration(value)
+                document.mediaPresentationDuration = MPDParser.parseDuration(value)
             }
             if let value = attributeDict["minimumUpdatePeriod"] {
-                document.minimumUpdatePeriod = parseDuration(value) ?? 2
+                document.minimumUpdatePeriod = MPDParser.parseDuration(value) ?? 2
             }
             if let value = attributeDict["availabilityStartTime"] {
-                document.availabilityStartTime = parseDate(value)
+                document.availabilityStartTime = MPDParser.parseDate(value)
             }
             if let value = attributeDict["timeShiftBufferDepth"] {
-                document.timeShiftBufferDepth = parseDuration(value)
+                document.timeShiftBufferDepth = MPDParser.parseDuration(value)
             }
             if let value = attributeDict["suggestedPresentationDelay"] {
-                document.suggestedPresentationDelay = parseDuration(value)
+                document.suggestedPresentationDelay = MPDParser.parseDuration(value)
             }
 
         case "Period":
             let period = MPDPeriod()
             period.id = attributeDict["id"]
-            period.start = attributeDict["start"].flatMap { parseDuration($0) }
-            period.duration = attributeDict["duration"].flatMap { parseDuration($0) }
+            period.start = attributeDict["start"].flatMap { MPDParser.parseDuration($0) }
+            period.duration = attributeDict["duration"].flatMap { MPDParser.parseDuration($0) }
             document.periods.append(period)
             currentPeriod = period
 
@@ -187,38 +184,31 @@ final class MPDParser: NSObject, XMLParserDelegate {
             let template = MPDSegmentTemplate()
             if let value = attributeDict["media"] { template.media = value }
             if let value = attributeDict["initialization"] { template.initialization = value }
-            if let value = attributeDict["timescale"].flatMap { Double($0) } { template.timescale = value }
-            if let value = attributeDict["startNumber"].flatMap { Int($0) } { template.startNumber = value }
-            if let value = attributeDict["duration"].flatMap { Double($0) } { template.duration = value }
-            if let value = attributeDict["presentationTimeOffset"].flatMap { Double($0) } { template.pto = value }
+            if let value = attributeDict["timescale"].flatMap({ Double($0) }) { template.timescale = value }
+            if let value = attributeDict["startNumber"].flatMap({ Int($0) }) { template.startNumber = value }
+            if let value = attributeDict["duration"].flatMap({ Double($0) }) { template.duration = value }
+            if let value = attributeDict["presentationTimeOffset"].flatMap({ Double($0) }) { template.pto = value }
             if let rep = currentRepresentation {
-                if let existing = rep.segmentTemplate { merge(template, into: existing) }
-                else { rep.segmentTemplate = template }
-                currentTemplate = rep.segmentTemplate
+                rep.segmentTemplate = template
+                currentTemplate = template
             } else if let adaptation = currentAdaptation {
-                if let existing = adaptation.segmentTemplate { merge(template, into: existing) }
-                else { adaptation.segmentTemplate = template }
-                currentTemplate = adaptation.segmentTemplate
+                adaptation.segmentTemplate = template
+                currentTemplate = template
             } else {
                 currentTemplate = template
             }
-
-        case "SegmentTimeline":
-            break
 
         case "S":
             guard let template = currentTemplate else { break }
             let t = attributeDict["t"].flatMap { Double($0) }
             let d = attributeDict["d"].flatMap { Double($0) } ?? 0
             let r = attributeDict["r"].flatMap { Int($0) } ?? 0
-            let entry = MPDTimeline(t: t ?? 0, d: d, r: r)
-            template.timeline.append(entry)
-            currentTimelineEntry = entry
+            template.timeline.append(MPDTimeline(t: t ?? 0, d: d, r: r))
 
         case "SegmentList":
             let list = MPDSegmentList()
-            if let value = attributeDict["duration"].flatMap { Double($0) } { list.duration = value }
-            if let value = attributeDict["timescale"].flatMap { Double($0) } { list.timescale = value }
+            if let value = attributeDict["duration"].flatMap({ Double($0) }) { list.duration = value }
+            if let value = attributeDict["timescale"].flatMap({ Double($0) }) { list.timescale = value }
             currentSegmentList = list
             if let rep = currentRepresentation { rep.segmentList = list }
             else if let adaptation = currentAdaptation { adaptation.segmentList = list }
@@ -238,12 +228,8 @@ final class MPDParser: NSObject, XMLParserDelegate {
                                            value: attributeDict["value"],
                                            kid: attributeDict.first { $0.key.lowercased().hasSuffix("default_kid") }?.value,
                                            pssh: nil)
-            currentProtection = protection
             if let rep = currentRepresentation { rep.protection.append(protection) }
             else if let adaptation = currentAdaptation { adaptation.protection.append(protection) }
-
-        case "pssh":
-            textBuffer = ""
 
         default:
             break
@@ -278,12 +264,11 @@ final class MPDParser: NSObject, XMLParserDelegate {
 
         case "pssh":
             let value = textBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let data = Data(base64Encoded: value, options: [.ignoreUnknownCharacters]) {
-                if let index = currentRepresentation?.protection.indices.last {
-                    currentRepresentation?.protection[index].pssh = data
-                } else if let index = currentAdaptation?.protection.indices.last {
-                    currentAdaptation?.protection[index].pssh = data
-                }
+            guard let data = Data(base64Encoded: value, options: [.ignoreUnknownCharacters]) else { return }
+            if let rep = currentRepresentation, !rep.protection.isEmpty {
+                rep.protection[rep.protection.count - 1].pssh = data
+            } else if let adaptation = currentAdaptation, !adaptation.protection.isEmpty {
+                adaptation.protection[adaptation.protection.count - 1].pssh = data
             }
 
         case "Period":
@@ -305,17 +290,9 @@ final class MPDParser: NSObject, XMLParserDelegate {
         case "SegmentList":
             currentSegmentList = nil
 
-        case "ContentProtection":
-            currentProtection = nil
-
-        case "S":
-            currentTimelineEntry = nil
-
         default:
             break
         }
-        _ = currentProtection
-        _ = currentTimelineEntry
     }
 
     // MARK: Helpers
@@ -327,17 +304,8 @@ final class MPDParser: NSObject, XMLParserDelegate {
         return name
     }
 
-    private func merge(_ source: MPDSegmentTemplate, into target: MPDSegmentTemplate) {
-        if let value = source.media { target.media = value }
-        if let value = source.initialization { target.initialization = value }
-        if source.timescale != 1 { target.timescale = source.timescale }
-        if source.startNumber != 1 { target.startNumber = source.startNumber }
-        if let value = source.duration { target.duration = value }
-        if source.pto != 0 { target.pto = source.pto }
-        target.timeline.append(contentsOf: source.timeline)
-    }
-
-    /// ISO8601 duration -> ç§?    static func parseDuration(_ text: String) -> Double? {
+    /// ISO8601 duration -> seconds
+    static func parseDuration(_ text: String) -> Double? {
         var value = text.trimmingCharacters(in: .whitespaces)
         guard !value.isEmpty else { return nil }
         var negative = false

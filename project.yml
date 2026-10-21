@@ -37,7 +37,8 @@ targets:
     info:
       path: AuroraPlayer/Info.plist
       properties:
-        CFBundleDisplayName: 极光播放�?        CFBundleShortVersionString: "1.1"
+        CFBundleDisplayName: 极光播放器
+        CFBundleShortVersionString: "1.1"
         CFBundleVersion: "2"
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
@@ -55,6 +56,7 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
           NSAllowsArbitraryLoadsInWebContent: true
+          NSAllowsLocalNetworking: true
         UIBackgroundModes:
           - audio
         ITSAppUsesNonExemptEncryption: false
