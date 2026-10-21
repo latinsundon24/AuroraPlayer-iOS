@@ -122,7 +122,8 @@ final class DashPlayback {
         }
 
         if doc.isDynamic {
-            refreshWindow(doc: doc, period: period, initial: true)            // 等直播窗口里至少有 2 个分片，避免 AVPlayer 拿到空清单
+            refreshWindow(doc: doc, period: period, initial: true)
+            // 等直播窗口里至少有 2 个分片，避免 AVPlayer 拿到空清单
             var waited = 0
             while waited < 20, currentWindowCount() < 2 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)

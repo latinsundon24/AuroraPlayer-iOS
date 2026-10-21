@@ -71,7 +71,7 @@ final class LocalHTTPServer {
         }
         connection.start(queue: queue)
         read(connection, buffer: Data())
-        queue.asyncAfter(deadline: .now() + 30) { [weak connection] in
+        queue.asyncAfter(deadline: .now() + 90) { [weak connection] in
             connection?.cancel()
         }
     }

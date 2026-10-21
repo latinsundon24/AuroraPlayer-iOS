@@ -25,6 +25,9 @@ final class AVPlayerEngine: ObservableObject {
     private var statusObserver: NSKeyValueObservation?
     private var rate: Float = 1.0
     private var dash: DashPlayback?
+    /// 用户是否希望播放（DASH 准备完成后据此自动起播）
+    private var wantsPlayback = false
+    private var openToken = UUID()
 
     init() {
         player.actionAtItemEnd = .pause
@@ -63,6 +66,8 @@ final class AVPlayerEngine: ObservableObject {
 
     func open(_ channel: Channel) {
         stopCurrent()
+        let token = UUID()
+        openToken = token
         errorMessage = nil
         isPreparing = false
         statusText = nil
@@ -75,12 +80,18 @@ final class AVPlayerEngine: ObservableObject {
                 do {
                     let playback = try DashPlayback(channel: channel)
                     let url = try await playback.start()
+                    // 期间用户可能已切台
+                    guard self.openToken == token else {
+                        playback.stop()
+                        return
+                    }
                     self.dash = playback
                     self.isLiveStream = playback.isLive
-                    self.load(url: url, headers: [:])
                     self.isPreparing = false
                     self.statusText = nil
+                    self.load(url: url, headers: [:])
                 } catch {
+                    guard self.openToken == token else { return }
                     self.isPreparing = false
                     self.statusText = nil
                     self.errorMessage = error.localizedDescription
@@ -94,6 +105,7 @@ final class AVPlayerEngine: ObservableObject {
     }
 
     func stopCurrent() {
+        openToken = UUID()
         dash?.stop()
         dash = nil
         pause()
@@ -113,6 +125,9 @@ final class AVPlayerEngine: ObservableObject {
         let asset = options.map { AVURLAsset(url: url, options: $0) } ?? AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
+        if wantsPlayback {
+            player.playImmediately(atRate: rate)
+        }
 
         statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             DispatchQueue.main.async {
@@ -135,11 +150,13 @@ final class AVPlayerEngine: ObservableObject {
     // MARK: - 控制
 
     func play() {
+        wantsPlayback = true
         player.playImmediately(atRate: rate)
         isPlaying = true
     }
 
     func pause() {
+        wantsPlayback = false
         player.pause()
         isPlaying = false
     }
