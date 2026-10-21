@@ -41,6 +41,19 @@ struct PlayerScreen: View {
                     }
                 }
 
+            if engine.isPreparing {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .scaleEffect(1.4)
+                    Text(engine.statusText ?? "正在准备…")
+                        .font(.footnote)
+                        .foregroundColor(.white.opacity(0.8))
+                }
+                .padding(22)
+                .background(Color.black.opacity(0.55))
+                .cornerRadius(14)
+            }
+
             if let message = engine.errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -88,7 +101,7 @@ struct PlayerScreen: View {
     private func loadCurrent() {
         guard let channel = currentChannel else { return }
         engine.setRate(speeds[speedIndex])
-        engine.load(channel.url)
+        engine.open(channel)
         engine.play()
     }
 
@@ -233,7 +246,7 @@ struct PlayerScreen: View {
                 } header: {
                     Text("播放")
                 } footer: {
-                    Text("iOS 端强制软解需要集成 VLCKit（工程内 optional-vlc 目录有现成代码）。AVPlayer 在不支持硬解时会自动回退。")
+                    Text("DASH/ClearKey 频道由 App 内解密并转为本地 HLS 后播放；HLS 频道直接交给系统 AVPlayer。")
                 }
 
                 Section(header: Text("屏幕比例")) {

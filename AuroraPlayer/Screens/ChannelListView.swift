@@ -27,6 +27,15 @@ struct ChannelListView: View {
                             .font(.caption2)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
+                        if channel.isDASH {
+                            Text(channel.hasClearKey ? "DASH·CK" : "DASH")
+                                .font(.system(size: 9, weight: .semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.18))
+                                .foregroundColor(.orange)
+                                .cornerRadius(4)
+                        }
                     }
                     .padding(.vertical, 3)
                 }

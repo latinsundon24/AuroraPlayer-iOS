@@ -1,54 +1,86 @@
 import Foundation
 
-/// 容错解析 .m3u / .m3u8 / .txt 播放列表
+/// 容错解析 .m3u / .m3u8 / .txt 播放列表。
 ///
-/// 支持：
-///   #EXTM3U
-///   #EXTINF:-1 group-title="…" tvg-name="…",名称   + 下一行网址
-///   #EXTGRP:分组
-///   名称,网址    名称|网址    网址,名称    网址|名称
-///   仅网址（自动从网址取名）
+/// 支持 Kodi / TiviMate 常用标签：
+///   #EXTINF:-1 group-title="…" tvg-logo="…",名称
+///   #KODIPROP:inputstream.adaptive.manifest_type=mpd
+///   #KODIPROP:inputstream.adaptive.license_type=clearkey
+///   #KODIPROP:inputstream.adaptive.license_key=KID:KEY
+///   #EXTVLCOPT:http-user-agent=…
+///   #EXTVLCOPT:http-referrer=…
 enum PlaylistParser {
 
     static func parse(_ content: String) -> [Channel] {
         var out: [Channel] = []
         var pendingName: String?
         var pendingGroup: String?
+        var pendingLogo: String?
+        var manifest: ManifestType = .auto
+        var licenseType: String?
+        var licenseURL: String?
+        var keys: [String: String] = [:]
+        var headers: [String: String] = [:]
 
         let normalized = content
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+        var rawLines = normalized.components(separatedBy: "\n")
+        if !rawLines.isEmpty, rawLines[0].hasPrefix("\u{FEFF}") {
+            rawLines[0] = String(rawLines[0].dropFirst())
+        }
 
-        let lines = normalized.components(separatedBy: "\n")
+        func resetMeta() {
+            manifest = .auto
+            licenseType = nil
+            licenseURL = nil
+            keys = [:]
+            headers = [:]
+        }
 
-        for raw in lines {
+        for raw in rawLines {
             var line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty { continue }
-            if line.hasPrefix("\u{FEFF}") {
-                line = String(line.dropFirst())
-            }
 
             if line.hasPrefix("#EXTINF") {
                 if let comma = line.firstIndex(of: ",") {
                     pendingName = String(line[line.index(after: comma)...])
                         .trimmingCharacters(in: .whitespaces)
+                    let attrs = String(line[line.startIndex..<comma])
+                    if let g = value(of: "group-title", in: attrs), !g.isEmpty { pendingGroup = g }
+                    if let l = value(of: "tvg-logo", in: attrs), !l.isEmpty { pendingLogo = l }
+                    if (pendingName ?? "").isEmpty, let n = value(of: "tvg-name", in: attrs), !n.isEmpty {
+                        pendingName = n
+                    }
                 } else {
                     pendingName = ""
                 }
-                if let g = attribute(line, "group-title"), !g.isEmpty {
-                    pendingGroup = g
-                }
-                if (pendingName ?? "").isEmpty, let n = attribute(line, "tvg-name"), !n.isEmpty {
-                    pendingName = n
-                }
+                resetMeta()
                 continue
             }
 
             if line.hasPrefix("#EXTGRP") {
                 if let colon = line.firstIndex(of: ":") {
-                    pendingGroup = String(line[line.index(after: colon)...])
-                        .trimmingCharacters(in: .whitespaces)
+                    let g = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+                    if !g.isEmpty { pendingGroup = g }
                 }
+                continue
+            }
+
+            if line.hasPrefix("#KODIPROP:") {
+                let body = String(line.dropFirst("#KODIPROP:".count))
+                applyKodiProp(body,
+                              manifest: &manifest,
+                              licenseType: &licenseType,
+                              licenseURL: &licenseURL,
+                              keys: &keys,
+                              headers: &headers)
+                continue
+            }
+
+            if line.hasPrefix("#EXTVLCOPT:") {
+                let body = String(line.dropFirst("#EXTVLCOPT:".count))
+                applyVLCOpt(body, headers: &headers)
                 continue
             }
 
@@ -78,18 +110,116 @@ enum PlaylistParser {
             }
 
             let group = (pendingGroup?.isEmpty == false) ? pendingGroup! : "默认"
+            let finalName = (name?.isEmpty == false) ? name! : deriveName(url)
+
+            let channel = Channel(name: finalName,
+                                  url: url,
+                                  group: group,
+                                  logo: pendingLogo,
+                                  manifestType: manifest,
+                                  licenseType: licenseType,
+                                  keys: keys,
+                                  licenseURL: licenseURL,
+                                  headers: headers)
+            out.append(channel)
+
             pendingName = nil
             pendingGroup = nil
-
-            if url.isEmpty { continue }
-            let finalName = (name?.isEmpty == false) ? name! : deriveName(url)
-            out.append(Channel(name: finalName, url: url, group: group))
+            pendingLogo = nil
+            resetMeta()
         }
 
         return out
     }
 
-    private static func firstSeparator(_ s: String) -> String.Index? {
+    // MARK: - KODIPROP
+
+    private static func applyKodiProp(_ body: String,
+                                      manifest: inout ManifestType,
+                                      licenseType: inout String?,
+                                      licenseURL: inout String?,
+                                      keys: inout [String: String],
+                                      headers: inout [String: String]) {
+        let parts = body.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return }
+        let name = String(parts[0]).trimmingCharacters(in: .whitespaces).lowercased()
+        let raw = String(parts[1]).trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty else { return }
+
+        switch name {
+        case "inputstream.adaptive.manifest_type":
+            switch raw.lowercased() {
+            case "mpd", "dash": manifest = .dash
+            case "hls", "m3u8": manifest = .hls
+            case "ism", "smoothstreaming": manifest = .smooth
+            default: manifest = .auto
+            }
+
+        case "inputstream.adaptive.license_type":
+            licenseType = raw.lowercased()
+
+        case "inputstream.adaptive.license_key":
+            let parsedKeys = ClearKeyParser.parse(raw)
+            if !parsedKeys.isEmpty {
+                for (k, v) in parsedKeys { keys[k] = v }
+                if licenseType == nil { licenseType = "clearkey" }
+            } else if raw.lowercased().hasPrefix("http") {
+                licenseURL = raw
+                if licenseType == nil { licenseType = "clearkey" }
+            } else if raw.lowercased().hasPrefix("data:") || raw.hasPrefix("{") || raw.hasPrefix("[") {
+                if let decoded = ClearKeyParser.parseInlineJSON(raw) {
+                    for (k, v) in decoded { keys[k] = v }
+                    if licenseType == nil { licenseType = "clearkey" }
+                }
+            }
+
+        case "inputstream.adaptive.stream_headers":
+            applyHeaderPairs(raw, headers: &headers)
+
+        case "inputstream.adaptive.manifest_headers":
+            applyHeaderPairs(raw, headers: &headers)
+
+        default:
+            break
+        }
+    }
+
+    private static func applyVLCOpt(_ body: String, headers: inout [String: String]) {
+        let parts = body.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return }
+        let key = String(parts[0]).trimmingCharacters(in: .whitespaces).lowercased()
+        let value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+        switch key {
+        case "http-user-agent":
+            headers["User-Agent"] = value
+        case "http-referrer", "http-referer":
+            headers["Referer"] = value
+        case "http-origin":
+            headers["Origin"] = value
+        case "http-cookie":
+            headers["Cookie"] = value
+        default:
+            if key.hasPrefix("http-") {
+                headers[String(key.dropFirst(5))] = value
+            }
+        }
+    }
+
+    /// "User-Agent=xxx&Referer=yyy" 形式
+    private static func applyHeaderPairs(_ raw: String, headers: inout [String: String]) {
+        let decoded = raw.removingPercentEncoding ?? raw
+        for pair in decoded.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard kv.count == 2 else { continue }
+            let key = String(kv[0]).trimmingCharacters(in: .whitespaces)
+            let value = String(kv[1]).trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty, !value.isEmpty { headers[key] = value }
+        }
+    }
+
+    // MARK: - Helpers
+
+    static func firstSeparator(_ s: String) -> String.Index? {
         for idx in s.indices {
             let c = s[idx]
             if c == "," || c == "|" { return idx }
@@ -97,7 +227,18 @@ enum PlaylistParser {
         return nil
     }
 
-    private static func attribute(_ line: String, _ key: String) -> String? {
+    static func deriveName(_ url: String) -> String {
+        var u = url
+        if let q = u.firstIndex(of: "?") { u = String(u[..<q]) }
+        if let r = u.range(of: "://") { u = String(u[r.upperBound...]) }
+        if let slash = u.lastIndex(of: "/"), slash < u.index(before: u.endIndex) {
+            return String(u[u.index(after: slash)...])
+        }
+        return u.isEmpty ? url : u
+    }
+
+    /// 取属性值，如 group-title="xxx"
+    static func value(of key: String, in line: String) -> String? {
         let pattern = key + "=\"([^\"]*)\""
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return nil
@@ -109,18 +250,102 @@ enum PlaylistParser {
         }
         return ns.substring(with: match.range(at: 1))
     }
+}
 
-    static func deriveName(_ url: String) -> String {
-        var u = url
-        if let q = u.firstIndex(of: "?") {
-            u = String(u[..<q])
+/// ClearKey 各种写法解析
+enum ClearKeyParser {
+
+    /// 支持：
+    ///   kid:key
+    ///   kid:key,kid2:key2
+    ///   {"keys":[{"kty":"oct","kid":"…","k":"…"}]}
+    ///   data:application/json;base64,…
+    static func parse(_ raw: String) -> [String: String] {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return [:] }
+
+        if text.lowercased().hasPrefix("data:") {
+            return parseInlineJSON(text) ?? [:]
         }
-        if let r = u.range(of: "://") {
-            u = String(u[r.upperBound...])
+        if text.hasPrefix("{") || text.hasPrefix("[") {
+            return parseInlineJSON(text) ?? [:]
         }
-        if let slash = u.lastIndex(of: "/"), slash < u.index(before: u.endIndex) {
-            return String(u[u.index(after: slash)...])
+
+        // Kodi 允许在 key 后面跟附加参数，用 ; 分隔
+        if let semi = text.firstIndex(of: ";") { text = String(text[..<semi]) }
+
+        var result: [String: String] = [:]
+        let pairs = text.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init)
+        for pair in pairs {
+            let kv = pair.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard kv.count == 2 else { continue }
+            let kid = normalizeHex(String(kv[0]))
+            let key = normalizeHex(String(kv[1]))
+            guard kid.count == 32, key.count == 32 else { continue }
+            result[kid] = key
         }
-        return u.isEmpty ? url : u
+        return result
+    }
+
+    static func parseInlineJSON(_ raw: String) -> [String: String]? {
+        var jsonText = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if jsonText.lowercased().hasPrefix("data:") {
+            guard let comma = jsonText.firstIndex(of: ",") else { return nil }
+            let header = jsonText[..<comma].lowercased()
+            let payload = String(jsonText[jsonText.index(after: comma)...])
+            if header.contains("base64") {
+                guard let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]) else { return nil }
+                jsonText = String(data: data, encoding: .utf8) ?? ""
+            } else {
+                jsonText = payload.removingPercentEncoding ?? payload
+            }
+        }
+        guard let data = jsonText.data(using: .utf8) else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        var result: [String: String] = [:]
+        if let dict = object as? [String: Any] {
+            collectJWK(dict, into: &result)
+            if let kids = dict["kids"] as? [String], let key = dict["key"] as? String {
+                let keyHex = normalizeOrBase64(key)
+                for kid in kids {
+                    if let kidHex = normalizeOrBase64(kid), let k = keyHex { result[kidHex] = k }
+                }
+            }
+        } else if let array = object as? [[String: Any]] {
+            for item in array { collectJWK(item, into: &result) }
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    private static func collectJWK(_ dict: [String: Any], into result: inout [String: String]) {
+        if let kid = dict["kid"] as? String, let key = dict["k"] as? String,
+           let kidHex = normalizeOrBase64(kid), let keyHex = normalizeOrBase64(key) {
+            result[kidHex] = keyHex
+        }
+        if let keys = dict["keys"] as? [[String: Any]] {
+            for item in keys { collectJWK(item, into: &result) }
+        }
+    }
+
+    /// hex 原样规范化；不是 hex 时按 base64url 解码
+    static func normalizeOrBase64(_ value: String) -> String? {
+        let hex = normalizeHex(value)
+        if hex.count == 32 { return hex }
+        var b64 = value.replacingOccurrences(of: "-", with: "+")
+                       .replacingOccurrences(of: "_", with: "/")
+        let pad = b64.count % 4
+        if pad > 0 { b64 += String(repeating: "=", count: 4 - pad) }
+        guard let data = Data(base64Encoded: b64), data.count == 16 else { return nil }
+        return data.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func normalizeHex(_ value: String) -> String {
+        let cleaned = value
+            .lowercased()
+            .replacingOccurrences(of: "0x", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .filter { $0.isHexDigit }
+        return cleaned
     }
 }
