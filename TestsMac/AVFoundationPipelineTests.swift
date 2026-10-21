@@ -6,6 +6,7 @@ import AVFoundation
 final class AVFoundationPipelineTests: XCTestCase {
 
     private var server: LocalHTTPServer?
+    private let log = RequestLog()
 
     private let kid = "feedf00deedeadbeeff0baadf00dd00d"
     private let key = "00112233445566778899aabbccddeeff"
@@ -14,6 +15,25 @@ final class AVFoundationPipelineTests: XCTestCase {
         server?.stop()
         server = nil
         super.tearDown()
+    }
+
+    final class RequestLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [String] = []
+
+        func add(_ text: String) {
+            lock.lock()
+            entries.append(text)
+            lock.unlock()
+        }
+
+        func drain() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            let copy = entries
+            entries.removeAll()
+            return copy
+        }
     }
 
     // MARK: - 样本
@@ -47,9 +67,8 @@ final class AVFoundationPipelineTests: XCTestCase {
         return Pieces(initSegment: MP4Crypto.stripEncryption(from: initData), segments: segments)
     }
 
-    // MARK: - 封装实验
+    // MARK: - 封装
 
-    /// 改 ftyp 的 major brand 与第一个 compatible brand
     private func withBrand(_ data: Data, _ brand: String) -> Data {
         var bytes = [UInt8](data)
         let tag = Array(brand.utf8)
@@ -59,7 +78,6 @@ final class AVFoundationPipelineTests: XCTestCase {
         return Data(bytes)
     }
 
-    /// 给分片加 styp（HLS fMP4 常见写法，Bento4 DASH 输出默认没有）
     private func withStyp(_ segment: Data) -> Data {
         var payload = Data("msdh".utf8)
         payload.append(Data([0, 0, 0, 0]))
@@ -74,36 +92,37 @@ final class AVFoundationPipelineTests: XCTestCase {
         return box
     }
 
-    private func mediaPlaylist(_ tag: String, durations: [Double]) -> String {
-        var text = """
-        #EXTM3U
-        #EXT-X-VERSION:7
-        #EXT-X-TARGETDURATION:9
-        #EXT-X-MEDIA-SEQUENCE:0
-        #EXT-X-PLAYLIST-TYPE:VOD
-        #EXT-X-MAP:URI="\(tag)-init.mp4"
-        """
+    private func mediaPlaylist(_ tag: String, durations: [Double], extraTags: String = "") -> String {
+        var text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        if !extraTags.isEmpty { text += extraTags + "\n" }
+        text += "#EXT-X-MAP:URI=\"\(tag)-init.mp4\"\n"
         for (index, duration) in durations.enumerated() {
-            text += "\n#EXTINF:\(String(format: "%.3f", duration)),\n\(tag)-n\(index + 1).m4s"
+            text += "#EXTINF:\(String(format: "%.3f", duration)),\n\(tag)-n\(index + 1).m4s\n"
         }
-        text += "\n#EXT-X-ENDLIST\n"
+        text += "#EXT-X-ENDLIST\n"
         return text
     }
 
-    private func masterPlaylist(_ tag: String) -> String {
-        """
-        #EXTM3U
-        #EXT-X-VERSION:7
-        #EXT-X-INDEPENDENT-SEGMENTS
-        #EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS="avc1.64001E",RESOLUTION=640x360
-        \(tag)-v.m3u8
-        """
+    private func masterPlaylist(_ tag: String, codecs: Bool = true, independent: Bool = true) -> String {
+        var text = "#EXTM3U\n#EXT-X-VERSION:7\n"
+        if independent { text += "#EXT-X-INDEPENDENT-SEGMENTS\n" }
+        if codecs {
+            text += "#EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS=\"avc1.64001E\",RESOLUTION=640x360\n"
+        } else {
+            text += "#EXT-X-STREAM-INF:BANDWIDTH=347819,RESOLUTION=640x360\n"
+        }
+        text += "\(tag)-v.m3u8\n"
+        return text
     }
 
     private func startServer(files: [String: Data]) throws -> UInt16 {
+        let logger = log
         let server = try LocalHTTPServer { path, _ in
             let name = path.split(separator: "/").last.map(String.init) ?? ""
-            guard let data = files[name] else { return (404, "text/plain", Data()) }
+            guard let data = files[name] else {
+                logger.add("\(path) -> 404")
+                return (404, "text/plain", Data())
+            }
             let mime: String
             if name.hasSuffix(".m3u8") {
                 mime = "application/vnd.apple.mpegurl"
@@ -112,57 +131,77 @@ final class AVFoundationPipelineTests: XCTestCase {
             } else {
                 mime = "video/iso.segment"
             }
+            logger.add("\(path) -> 200 \(data.count)")
             return (200, mime, data)
         }
         self.server = server
         return server.port
     }
 
-    private func videoTrackCount(port: UInt16, tag: String) async -> String {
-        let url = URL(string: "http://127.0.0.1:\(port)/\(tag)-master.m3u8")!
+    private func probe(port: UInt16, path: String, label: String) async -> String {
+        let url = URL(string: "http://127.0.0.1:\(port)/\(path)")!
         let asset = AVURLAsset(url: url)
         do {
             let tracks = try await asset.loadTracks(withMediaType: .video)
             let duration = try await asset.load(.duration)
-            return "\(tag): tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
+            return "\(label): tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
         } catch {
-            return "\(tag): error \(error)"
+            return "\(label): error \(error)"
         }
     }
 
-    // MARK: - 诊断：找出 AVFoundation 接受的封装形态
+    // MARK: - 诊断
 
     func testDiagnoseContainerVariants() async throws {
         let pieces = try makePieces()
         let durations = [8.342, 5.005]
         var files: [String: Data] = [:]
 
-        let variants: [(String, Data, [Data])] = [
-            ("base", pieces.initSegment, pieces.segments),
-            ("iso6", withBrand(pieces.initSegment, "iso6"), pieces.segments),
-            ("styp", pieces.initSegment, pieces.segments.map(withStyp)),
-            ("iso6styp", withBrand(pieces.initSegment, "iso6"), pieces.segments.map(withStyp)),
-            ("cmfc", withBrand(pieces.initSegment, "cmfc"), pieces.segments.map(withStyp))
+        struct Variant {
+            var tag: String
+            var initSegment: Data
+            var segments: [Data]
+            var master: Bool
+            var codecs: Bool = true
+            var independent: Bool = true
+            var extraTags: String = ""
+        }
+
+        let variants: [Variant] = [
+            Variant(tag: "base", initSegment: pieces.initSegment, segments: pieces.segments, master: true),
+            Variant(tag: "direct", initSegment: pieces.initSegment, segments: pieces.segments, master: false),
+            Variant(tag: "nocodecs", initSegment: pieces.initSegment, segments: pieces.segments, master: true, codecs: false),
+            Variant(tag: "noindep", initSegment: pieces.initSegment, segments: pieces.segments, master: true, independent: false),
+            Variant(tag: "iso6styp", initSegment: withBrand(pieces.initSegment, "iso6"),
+                    segments: pieces.segments.map(withStyp), master: true),
+            Variant(tag: "plain", initSegment: pieces.initSegment, segments: pieces.segments, master: true,
+                    extraTags: "#EXT-X-DISCONTINUITY-SEQUENCE:0")
         ]
 
-        for (tag, initSegment, segments) in variants {
-            files["\(tag)-init.mp4"] = initSegment
-            for (index, segment) in segments.enumerated() {
-                files["\(tag)-n\(index + 1).m4s"] = segment
+        for variant in variants {
+            files["\(variant.tag)-init.mp4"] = variant.initSegment
+            for (index, segment) in variant.segments.enumerated() {
+                files["\(variant.tag)-n\(index + 1).m4s"] = segment
             }
-            files["\(tag)-v.m3u8"] = Data(mediaPlaylist(tag, durations: durations).utf8)
-            files["\(tag)-master.m3u8"] = Data(masterPlaylist(tag).utf8)
+            files["\(variant.tag)-v.m3u8"] = Data(mediaPlaylist(variant.tag, durations: durations,
+                                                               extraTags: variant.extraTags).utf8)
+            files["\(variant.tag)-master.m3u8"] = Data(masterPlaylist(variant.tag, codecs: variant.codecs,
+                                                                      independent: variant.independent).utf8)
         }
 
         let port = try startServer(files: files)
         var results: [String] = []
-        for (tag, _, _) in variants {
-            let result = await videoTrackCount(port: port, tag: tag)
+        for variant in variants {
+            _ = log.drain()
+            let path = variant.master ? "\(variant.tag)-master.m3u8" : "\(variant.tag)-v.m3u8"
+            let result = await probe(port: port, path: path, label: variant.tag)
             results.append(result)
             NSLog("[Aurora][DIAG] %@", result)
+            for entry in log.drain() {
+                NSLog("[Aurora][DIAG]   %@", entry)
+            }
         }
 
-        // 整段 fMP4 作为本地文件（判断容器本身是否能被解析）
         let combined = pieces.initSegment + pieces.segments.reduce(Data(), +)
         let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-full-fmp4.mp4")
         try combined.write(to: fileURL)
