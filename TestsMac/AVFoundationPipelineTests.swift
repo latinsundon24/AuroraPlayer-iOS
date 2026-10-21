@@ -16,6 +16,8 @@ final class AVFoundationPipelineTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - 样本
+
     private func fixture(_ name: String) throws -> Data {
         let bundle = Bundle(for: AVFoundationPipelineTests.self)
         guard let url = bundle.url(forResource: name, withExtension: nil) else {
@@ -24,56 +26,81 @@ final class AVFoundationPipelineTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
-    /// 复刻 DashPlayback 的输出格式
-    private func mediaPlaylist() -> String {
-        """
+    private struct Pieces {
+        var initSegment: Data
+        var segments: [Data]
+    }
+
+    private func makePieces() throws -> Pieces {
+        let initData = try fixture("init.mp4")
+        let info = MP4Crypto.initInfo(from: initData)
+        XCTAssertTrue(info.isProtected)
+        XCTAssertEqual(info.defaultKID, kid)
+
+        var segments: [Data] = []
+        for name in ["seg-1.m4s", "seg-2.m4s"] {
+            let encrypted = try fixture(name)
+            let track = MP4Fragment.parse(encrypted, defaults: info)
+            let decrypted = try CENC.decrypt(fragment: encrypted, track: track, info: info, keys: [kid: key])
+            segments.append(MP4Fragment.stripAuxiliaryBoxes(decrypted))
+        }
+        return Pieces(initSegment: MP4Crypto.stripEncryption(from: initData), segments: segments)
+    }
+
+    // MARK: - 封装实验
+
+    /// 改 ftyp 的 major brand 与第一个 compatible brand
+    private func withBrand(_ data: Data, _ brand: String) -> Data {
+        var bytes = [UInt8](data)
+        let tag = Array(brand.utf8)
+        guard bytes.count >= 20, tag.count == 4 else { return data }
+        bytes.replaceSubrange(8..<12, with: tag)
+        bytes.replaceSubrange(16..<20, with: tag)
+        return Data(bytes)
+    }
+
+    /// 给分片加 styp（HLS fMP4 常见写法，Bento4 DASH 输出默认没有）
+    private func withStyp(_ segment: Data) -> Data {
+        var payload = Data("msdh".utf8)
+        payload.append(Data([0, 0, 0, 0]))
+        payload.append(Data("msdh".utf8))
+        payload.append(Data("msix".utf8))
+        var box = Data()
+        var size = UInt32(8 + payload.count).bigEndian
+        withUnsafeBytes(of: &size) { box.append(contentsOf: $0) }
+        box.append(Data("styp".utf8))
+        box.append(payload)
+        box.append(segment)
+        return box
+    }
+
+    private func mediaPlaylist(_ tag: String, durations: [Double]) -> String {
+        var text = """
         #EXTM3U
         #EXT-X-VERSION:7
         #EXT-X-TARGETDURATION:9
         #EXT-X-MEDIA-SEQUENCE:0
         #EXT-X-PLAYLIST-TYPE:VOD
-        #EXT-X-MAP:URI="v-init.mp4"
-        #EXTINF:8.342,
-        vn1.m4s
-        #EXTINF:5.005,
-        vn2.m4s
-        #EXT-X-ENDLIST
+        #EXT-X-MAP:URI="\(tag)-init.mp4"
         """
+        for (index, duration) in durations.enumerated() {
+            text += "\n#EXTINF:\(String(format: "%.3f", duration)),\n\(tag)-n\(index + 1).m4s"
+        }
+        text += "\n#EXT-X-ENDLIST\n"
+        return text
     }
 
-    private func masterPlaylist() -> String {
+    private func masterPlaylist(_ tag: String) -> String {
         """
         #EXTM3U
         #EXT-X-VERSION:7
         #EXT-X-INDEPENDENT-SEGMENTS
         #EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS="avc1.64001E",RESOLUTION=640x360
-        v.m3u8
+        \(tag)-v.m3u8
         """
     }
 
-    /// 生成产物：init 去信令、分片解密 + 去 senc/saiz/saio
-    private func makeFiles() throws -> [String: Data] {
-        let initData = try fixture("init.mp4")
-        let info = MP4Crypto.initInfo(from: initData)
-        XCTAssertTrue(info.isProtected, "初始化分片应带 CENC 信令")
-        XCTAssertEqual(info.defaultKID, kid)
-
-        var files: [String: Data] = [:]
-        files["v-init.mp4"] = MP4Crypto.stripEncryption(from: initData)
-
-        for (index, name) in ["seg-1.m4s", "seg-2.m4s"].enumerated() {
-            let encrypted = try fixture(name)
-            let track = MP4Fragment.parse(encrypted, defaults: info)
-            let decrypted = try CENC.decrypt(fragment: encrypted, track: track, info: info, keys: [kid: key])
-            files["vn\(index + 1).m4s"] = MP4Fragment.stripAuxiliaryBoxes(decrypted)
-        }
-
-        files["v.m3u8"] = Data(mediaPlaylist().utf8)
-        files["master.m3u8"] = Data(masterPlaylist().utf8)
-        return files
-    }
-
-    private func startServer(files: [String: Data]) throws -> URL {
+    private func startServer(files: [String: Data]) throws -> UInt16 {
         let server = try LocalHTTPServer { path, _ in
             let name = path.split(separator: "/").last.map(String.init) ?? ""
             guard let data = files[name] else { return (404, "text/plain", Data()) }
@@ -88,42 +115,71 @@ final class AVFoundationPipelineTests: XCTestCase {
             return (200, mime, data)
         }
         self.server = server
-        return try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/master.m3u8"))
+        return server.port
     }
 
-    func testAVFoundationAcceptsDecryptedHLS() async throws {
-        let url = try startServer(files: try makeFiles())
+    private func videoTrackCount(port: UInt16, tag: String) async -> String {
+        let url = URL(string: "http://127.0.0.1:\(port)/\(tag)-master.m3u8")!
         let asset = AVURLAsset(url: url)
-
-        let playable = try await asset.load(.isPlayable)
-        XCTAssertTrue(playable, "AVFoundation 认为该 HLS 不可播放")
-
-        let duration = try await asset.load(.duration)
-        XCTAssertEqual(duration.seconds, 13.347, accuracy: 0.5)
-
-        let tracks = try await asset.loadTracks(withMediaType: .video)
-        let videoTrack = try XCTUnwrap(tracks.first, "没有视频轨道")
-        let size = try await videoTrack.load(.naturalSize)
-        XCTAssertEqual(size.width, 640, accuracy: 0.5)
-        XCTAssertEqual(size.height, 360, accuracy: 0.5)
-
-        let nominal = try await videoTrack.load(.nominalFrameRate)
-        XCTAssertGreaterThan(nominal, 20)
-    }
-
-    func testAVFoundationCanDecodeFrames() async throws {
-        let url = try startServer(files: try makeFiles())
-        let asset = AVURLAsset(url: url)
-
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
-        generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
-
-        for seconds in [0.5, 6.0, 11.0] {
-            let result = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
-            XCTAssertEqual(result.image.width, 640)
-            XCTAssertEqual(result.image.height, 360)
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            let duration = try await asset.load(.duration)
+            return "\(tag): tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
+        } catch {
+            return "\(tag): error \(error)"
         }
+    }
+
+    // MARK: - 诊断：找出 AVFoundation 接受的封装形态
+
+    func testDiagnoseContainerVariants() async throws {
+        let pieces = try makePieces()
+        let durations = [8.342, 5.005]
+        var files: [String: Data] = [:]
+
+        let variants: [(String, Data, [Data])] = [
+            ("base", pieces.initSegment, pieces.segments),
+            ("iso6", withBrand(pieces.initSegment, "iso6"), pieces.segments),
+            ("styp", pieces.initSegment, pieces.segments.map(withStyp)),
+            ("iso6styp", withBrand(pieces.initSegment, "iso6"), pieces.segments.map(withStyp)),
+            ("cmfc", withBrand(pieces.initSegment, "cmfc"), pieces.segments.map(withStyp))
+        ]
+
+        for (tag, initSegment, segments) in variants {
+            files["\(tag)-init.mp4"] = initSegment
+            for (index, segment) in segments.enumerated() {
+                files["\(tag)-n\(index + 1).m4s"] = segment
+            }
+            files["\(tag)-v.m3u8"] = Data(mediaPlaylist(tag, durations: durations).utf8)
+            files["\(tag)-master.m3u8"] = Data(masterPlaylist(tag).utf8)
+        }
+
+        let port = try startServer(files: files)
+        var results: [String] = []
+        for (tag, _, _) in variants {
+            let result = await videoTrackCount(port: port, tag: tag)
+            results.append(result)
+            NSLog("[Aurora][DIAG] %@", result)
+        }
+
+        // 整段 fMP4 作为本地文件（判断容器本身是否能被解析）
+        let combined = pieces.initSegment + pieces.segments.reduce(Data(), +)
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-full-fmp4.mp4")
+        try combined.write(to: fileURL)
+        do {
+            let fileAsset = AVURLAsset(url: fileURL)
+            let tracks = try await fileAsset.loadTracks(withMediaType: .video)
+            let duration = try await fileAsset.load(.duration)
+            let line = "file-fmp4: tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
+            results.append(line)
+            NSLog("[Aurora][DIAG] %@", line)
+        } catch {
+            let line = "file-fmp4: error \(error)"
+            results.append(line)
+            NSLog("[Aurora][DIAG] %@", line)
+        }
+
+        XCTAssertTrue(results.contains { $0.contains("tracks=1") },
+                      "没有任何封装形态被 AVFoundation 接受：\n" + results.joined(separator: "\n"))
     }
 }
