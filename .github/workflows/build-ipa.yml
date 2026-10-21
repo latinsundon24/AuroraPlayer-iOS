@@ -36,6 +36,15 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
 
+      - name: Run AVFoundation container tests (macOS)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project AuroraPlayer.xcodeproj \
+            -scheme AuroraCoreMac \
+            -destination 'platform=macOS' \
+            -derivedDataPath build/mac-tests
+
       - name: Build unsigned archive
         run: |
           set -o pipefail

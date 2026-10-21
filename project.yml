@@ -81,6 +81,32 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AuroraPlayer.app/AuroraPlayer"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
+  AuroraCoreMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: AuroraPlayer
+        includes:
+          - "DASH/*.swift"
+          - "HLS/*.swift"
+          - "HTTPService.swift"
+          - "Models.swift"
+          - "PlaylistParser.swift"
+      - path: TestsMac
+        excludes:
+          - "Info.plist"
+      - path: Tests/Fixtures
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.myplayer.auroracoretests
+        INFOPLIST_FILE: TestsMac/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: "-"
+
 schemes:
   AuroraPlayer:
     build:
@@ -94,3 +120,11 @@ schemes:
         - AuroraPlayerTests
     archive:
       config: Release
+  AuroraCoreMac:
+    build:
+      targets:
+        AuroraCoreMacTests: all
+    test:
+      config: Debug
+      targets:
+        - AuroraCoreMacTests
