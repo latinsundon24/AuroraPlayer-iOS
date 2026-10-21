@@ -23,7 +23,7 @@ final class DashPlayback {
     }
 
     let channel: Channel
-    let manifestURL: URL
+    private var manifestURL: URL
 
     private(set) var document: MPDDocument?
     private(set) var videoStream: DASHStream?
@@ -76,6 +76,10 @@ final class DashPlayback {
 
     func start() async throws -> URL {
         let response = try await HTTPService.fetch(channel.url, headers: channel.headers)
+        // 跟随重定向后，相对地址要以最终 URL 为基准
+        if let finalURL = response.finalURL {
+            manifestURL = finalURL
+        }
         guard let doc = MPDParser.parse(data: response.data) else {
             throw Failure.manifest("XML 解析失败")
         }
