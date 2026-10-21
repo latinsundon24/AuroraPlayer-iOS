@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 
 struct PlayerScreen: View {
 
@@ -247,6 +248,22 @@ struct PlayerScreen: View {
                     Text("播放")
                 } footer: {
                     Text("DASH/ClearKey 频道由 App 内解密并转为本地 HLS 后播放；HLS 频道直接交给系统 AVPlayer。")
+                }
+
+                Section {
+                    Text(engine.diagnosticsText)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                    Button {
+                        UIPasteboard.general.string = engine.diagnosticsText
+                    } label: {
+                        Text("复制诊断信息")
+                    }
+                } header: {
+                    Text("诊断")
+                } footer: {
+                    Text("播放异常时请复制这里的内容发给开发者，可看到真实地址、播放模式与系统错误码。")
                 }
 
                 Section(header: Text("屏幕比例")) {

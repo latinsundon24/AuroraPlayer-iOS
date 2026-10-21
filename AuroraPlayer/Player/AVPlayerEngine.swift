@@ -17,6 +17,8 @@ final class AVPlayerEngine: ObservableObject {
     @Published var isPreparing: Bool = false
     @Published var statusText: String?
     @Published var isLiveStream: Bool = false
+    @Published var playbackURL: String = ""
+    @Published var playbackMode: String = "—"
 
     var onEnded: (() -> Void)?
 
@@ -80,10 +82,22 @@ final class AVPlayerEngine: ObservableObject {
         isPreparing = false
         statusText = nil
         isLiveStream = false
+        playbackURL = ""
+        playbackMode = "—"
+
+        let lower = channel.url.lowercased()
+        if lower.hasPrefix("rtmp://") || lower.hasPrefix("rtmps://")
+            || lower.hasPrefix("rtsp://") || lower.hasPrefix("udp://")
+            || lower.hasPrefix("mms://") || lower.hasSuffix(".flv") {
+            errorMessage = "该频道使用 AVPlayer 不支持的协议/封装（rtmp / rtsp / udp / flv）"
+            playbackMode = "不支持"
+            return
+        }
 
         if channel.isDASH {
             isPreparing = true
             statusText = "正在解析 DASH 流…"
+            playbackMode = "DASH（解密转本地 HLS）"
             Task {
                 do {
                     let playback = try DashPlayback(channel: channel)
@@ -106,6 +120,7 @@ final class AVPlayerEngine: ObservableObject {
                 }
             }
         } else if let url = URL(string: channel.url) {
+            playbackMode = "HLS 直连"
             load(url: url, headers: channel.headers)
         } else {
             errorMessage = "地址无效"
@@ -126,6 +141,7 @@ final class AVPlayerEngine: ObservableObject {
     // MARK: - 加载
 
     func load(url: URL, headers: [String: String] = [:]) {
+        playbackURL = url.absoluteString
         if let observer = endObserver {
             NotificationCenter.default.removeObserver(observer)
             endObserver = nil
@@ -173,6 +189,27 @@ final class AVPlayerEngine: ObservableObject {
 
     // MARK: - 控制
 
+    /// 给用户复制给开发者的一行行诊断信息
+    var diagnosticsText: String {
+        var lines: [String] = []
+        lines.append("频道：\(currentChannel?.name ?? "—")")
+        lines.append("地址：\(currentChannel?.url ?? "—")")
+        lines.append("模式：\(playbackMode)")
+        lines.append("播放 URL：\(playbackURL.isEmpty ? "—" : playbackURL)")
+        if let item = player.currentItem {
+            lines.append("Item：status=\(item.status.rawValue) tracks=\(item.tracks.count)")
+            let seconds = item.duration.seconds
+            lines.append("时长：\(seconds.isFinite && seconds > 0 ? String(format: "%.1f", seconds) : "未知/直播")")
+        }
+        if let errorMessage {
+            lines.append("错误：\(errorMessage)")
+        }
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        lines.append("版本：\(version) (\(build))")
+        return lines.joined(separator: "\n")
+    }
+
     /// 把 AVFoundation 的原始错误暴露出来，便于定位（例如 ATS 拦截、分片 4xx/5xx）
     private func report(item: AVPlayerItem) {
         guard item === player.currentItem else { return }
@@ -209,6 +246,7 @@ final class AVPlayerEngine: ObservableObject {
         do {
             let proxy = try HLSProxy(channel: channel)
             hlsProxy = proxy
+            playbackMode = "HLS 本地代理（放行异常证书）"
             errorMessage = nil
             NSLog("[Aurora] 改用 HLS 代理重试: %@", channel.url)
             load(url: proxy.entryURL, headers: [:])

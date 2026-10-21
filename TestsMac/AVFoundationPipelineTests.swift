@@ -3,8 +3,8 @@ import AVFoundation
 import QuartzCore
 import CoreVideo
 
-/// 用 AVFoundation 真正起播我们生成的 HLS（解密 + 去信令 + fMP4），
-/// 并抓取解码后的像素帧——验证 Apple 的解码链路能不能吃。
+/// 回归测试：解密 + 去信令后的 fMP4，能否被 Apple 自己的 HLS 链路真正播放并解出画面。
+/// （之前用 `AVURLAsset.loadTracks` 判断会得到 0 条轨道，因为 HLS 是惰性解析，必须真正起播。）
 final class AVFoundationPipelineTests: XCTestCase {
 
     private var server: LocalHTTPServer?
@@ -38,7 +38,7 @@ final class AVFoundationPipelineTests: XCTestCase {
         }
     }
 
-    // MARK: - 样本
+    // MARK: - 准备素材
 
     private func fixture(_ name: String) throws -> Data {
         let bundle = Bundle(for: AVFoundationPipelineTests.self)
@@ -48,66 +48,45 @@ final class AVFoundationPipelineTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
-    private struct Pieces {
-        var initSegment: Data
-        var segments: [Data]
-    }
-
-    private func makePieces() throws -> Pieces {
+    private func makeFiles() throws -> [String: Data] {
         let initData = try fixture("init.mp4")
         let info = MP4Crypto.initInfo(from: initData)
-        XCTAssertTrue(info.isProtected)
+        XCTAssertTrue(info.isProtected, "初始化分片应带 CENC 信令")
         XCTAssertEqual(info.defaultKID, kid)
 
-        var segments: [Data] = []
-        for name in ["seg-1.m4s", "seg-2.m4s"] {
+        var files: [String: Data] = [:]
+        files["v-init.mp4"] = MP4Crypto.stripEncryption(from: initData)
+
+        for (index, name) in ["seg-1.m4s", "seg-2.m4s"].enumerated() {
             let encrypted = try fixture(name)
             let track = MP4Fragment.parse(encrypted, defaults: info)
             let decrypted = try CENC.decrypt(fragment: encrypted, track: track, info: info, keys: [kid: key])
-            segments.append(MP4Fragment.stripAuxiliaryBoxes(decrypted))
+            files["vn\(index + 1).m4s"] = MP4Fragment.stripAuxiliaryBoxes(decrypted)
         }
-        return Pieces(initSegment: MP4Crypto.stripEncryption(from: initData), segments: segments)
-    }
 
-    // MARK: - 封装
+        files["v.m3u8"] = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:7
+        #EXT-X-TARGETDURATION:9
+        #EXT-X-MEDIA-SEQUENCE:0
+        #EXT-X-PLAYLIST-TYPE:VOD
+        #EXT-X-MAP:URI="v-init.mp4"
+        #EXTINF:8.342,
+        vn1.m4s
+        #EXTINF:5.005,
+        vn2.m4s
+        #EXT-X-ENDLIST
 
-    private func withBrand(_ data: Data, _ brand: String) -> Data {
-        var bytes = [UInt8](data)
-        let tag = Array(brand.utf8)
-        guard bytes.count >= 20, tag.count == 4 else { return data }
-        bytes.replaceSubrange(8..<12, with: tag)
-        bytes.replaceSubrange(16..<20, with: tag)
-        return Data(bytes)
-    }
+        """.utf8)
+        files["master.m3u8"] = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:7
+        #EXT-X-INDEPENDENT-SEGMENTS
+        #EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS="avc1.64001E",RESOLUTION=640x360
+        v.m3u8
 
-    private func withStyp(_ segment: Data) -> Data {
-        var payload = Data("msdh".utf8)
-        payload.append(Data([0, 0, 0, 0]))
-        payload.append(Data("msdh".utf8))
-        payload.append(Data("msix".utf8))
-        var box = Data()
-        var size = UInt32(8 + payload.count).bigEndian
-        withUnsafeBytes(of: &size) { box.append(contentsOf: $0) }
-        box.append(Data("styp".utf8))
-        box.append(payload)
-        box.append(segment)
-        return box
-    }
-
-    private func mediaPlaylist(_ tag: String, durations: [Double]) -> String {
-        var text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:0\n"
-        text += "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(tag)-init.mp4\"\n"
-        for (index, duration) in durations.enumerated() {
-            text += "#EXTINF:\(String(format: "%.3f", duration)),\n\(tag)-n\(index + 1).m4s\n"
-        }
-        text += "#EXT-X-ENDLIST\n"
-        return text
-    }
-
-    private func masterPlaylist(_ tag: String) -> String {
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n"
-            + "#EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS=\"avc1.64001E\",RESOLUTION=640x360\n"
-            + "\(tag)-v.m3u8\n"
+        """.utf8)
+        return files
     }
 
     private func startServer(files: [String: Data]) throws -> UInt16 {
@@ -133,8 +112,8 @@ final class AVFoundationPipelineTests: XCTestCase {
         return server.port
     }
 
-    /// 真起播：等 readyToPlay，抓解码帧
-    private func play(url: URL, label: String, seconds: Double = 6) async -> String {
+    /// 真起播并抓解码帧
+    private func play(url: URL, seconds: Double = 5) async -> (status: Int, width: Int, height: Int, frames: Int, error: String) {
         let item = AVPlayerItem(url: url)
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -145,7 +124,8 @@ final class AVFoundationPipelineTests: XCTestCase {
         player.play()
 
         var frames = 0
-        var firstFrameSize = CGSize.zero
+        var width = 0
+        var height = 0
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             try? await Task.sleep(nanoseconds: 150_000_000)
@@ -153,70 +133,92 @@ final class AVFoundationPipelineTests: XCTestCase {
             if output.hasNewPixelBuffer(forItemTime: time),
                let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
                 frames += 1
-                if firstFrameSize == .zero {
-                    firstFrameSize = CGSize(width: CVPixelBufferGetWidth(buffer),
-                                            height: CVPixelBufferGetHeight(buffer))
+                if width == 0 {
+                    width = CVPixelBufferGetWidth(buffer)
+                    height = CVPixelBufferGetHeight(buffer)
                 }
             }
         }
         player.pause()
-
-        let duration = item.duration.seconds
-        let size = item.presentationSize
-        let error = item.error.map { "\($0)" } ?? "nil"
-        return "\(label): status=\(item.status.rawValue) itemTracks=\(item.tracks.count)"
-            + " size=\(Int(size.width))x\(Int(size.height))"
-            + " frames=\(frames) frameSize=\(Int(firstFrameSize.width))x\(Int(firstFrameSize.height))"
-            + " duration=\(String(format: "%.2f", duration.isFinite ? duration : -1)) error=\(error)"
+        return (item.status.rawValue, width, height, frames, item.error.map { "\($0)" } ?? "nil")
     }
 
-    // MARK: - 诊断
+    // MARK: - 测试
 
-    func testPlaybackVariants() async throws {
-        let pieces = try makePieces()
-        let durations = [8.342, 5.005]
-        var files: [String: Data] = [:]
+    func testDecryptedHLSPlaysAndDecodesFrames() async throws {
+        let port = try startServer(files: try makeFiles())
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/master.m3u8"))
 
-        let variants: [(String, Data, [Data])] = [
-            ("base", pieces.initSegment, pieces.segments),
-            ("iso6styp", withBrand(pieces.initSegment, "iso6"), pieces.segments.map(withStyp))
-        ]
+        let result = await play(url: url)
+        NSLog("[Aurora][TEST] status=%d size=%dx%d frames=%d error=%@",
+              result.status, result.width, result.height, result.frames, result.error)
 
-        for (tag, initSegment, segments) in variants {
-            files["\(tag)-init.mp4"] = initSegment
-            for (index, segment) in segments.enumerated() {
-                files["\(tag)-n\(index + 1).m4s"] = segment
-            }
-            files["\(tag)-v.m3u8"] = Data(mediaPlaylist(tag, durations: durations).utf8)
-            files["\(tag)-master.m3u8"] = Data(masterPlaylist(tag).utf8)
-        }
+        XCTAssertEqual(result.status, AVPlayerItem.Status.readyToPlay.rawValue, "AVPlayerItem 未就绪：\(result.error)")
+        XCTAssertEqual(result.width, 640, "解码帧宽度不对")
+        XCTAssertEqual(result.height, 360, "解码帧高度不对")
+        XCTAssertGreaterThanOrEqual(result.frames, 3, "没有解出画面帧")
 
-        let port = try startServer(files: files)
-        var results: [String] = []
+        let requests = log.drain().joined(separator: "\n")
+        XCTAssertTrue(requests.contains("v-init.mp4 -> 200"), "没有加载初始化分片：\n\(requests)")
+        XCTAssertTrue(requests.contains("vn1.m4s -> 200"), "没有加载第一个分片：\n\(requests)")
+        XCTAssertTrue(requests.contains("vn2.m4s -> 200"), "没有加载第二个分片：\n\(requests)")
+    }
 
-        for (tag, _, _) in variants {
-            _ = log.drain()
-            let url = URL(string: "http://127.0.0.1:\(port)/\(tag)-master.m3u8")!
-            let result = await play(url: url, label: "hls-\(tag)")
-            results.append(result)
-            NSLog("[Aurora][DIAG] %@", result)
-            for entry in log.drain() {
-                NSLog("[Aurora][DIAG]   %@", entry)
-            }
-        }
-
-        // 整段 fMP4 当本地文件播（确认容器/解码本身没问题）
-        let combined = pieces.initSegment + pieces.segments.reduce(Data(), +)
-        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-full-fmp4.mp4")
+    func testDecryptedFMP4FilePlays() async throws {
+        let files = try makeFiles()
+        let combined = (files["v-init.mp4"] ?? Data())
+            + (files["vn1.m4s"] ?? Data())
+            + (files["vn2.m4s"] ?? Data())
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-fmp4-\(UUID().uuidString).mp4")
         try combined.write(to: fileURL)
-        _ = log.drain()
-        let fileResult = await play(url: fileURL, label: "file-fmp4")
-        results.append(fileResult)
-        NSLog("[Aurora][DIAG] %@", fileResult)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        XCTAssertTrue(results.contains { $0.hasPrefix("file-fmp4") && $0.contains("frames=") && !$0.contains("frames=0") },
-                      "本地 fMP4 都解不出帧：\n" + results.joined(separator: "\n"))
-        XCTAssertTrue(results.contains { $0.hasPrefix("hls-base") && !$0.contains("frames=0") },
-                      "本地 fMP4 能解，但 HLS 封装解不出帧：\n" + results.joined(separator: "\n"))
+        let result = await play(url: fileURL)
+        XCTAssertEqual(result.status, AVPlayerItem.Status.readyToPlay.rawValue, "本地 fMP4 未就绪：\(result.error)")
+        XCTAssertGreaterThanOrEqual(result.frames, 3, "本地 fMP4 没有解出画面帧")
+    }
+
+    /// 离线 DASH（file://）→ 解密 → 本地 HLS → AVPlayer，完整走一遍 App 里点“内置演示”的路径。
+    func testOfflineFileDASHEndToEnd() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-dash-\(UUID().uuidString)")
+        let videoDir = dir.appendingPathComponent("video/avc1")
+        try FileManager.default.createDirectory(at: videoDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        try fixture("init.mp4").write(to: videoDir.appendingPathComponent("init.mp4"))
+        try fixture("seg-1.m4s").write(to: videoDir.appendingPathComponent("seg-1.m4s"))
+        try fixture("seg-2.m4s").write(to: videoDir.appendingPathComponent("seg-2.m4s"))
+
+        let mpd = """
+        <?xml version="1.0" ?>
+        <MPD xmlns:cenc="urn:mpeg:cenc:2013" xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" minBufferTime="PT8.34S" mediaPresentationDuration="PT13.347S" type="static">
+          <Period>
+            <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1" maxWidth="640" maxHeight="360">
+              <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="feedf00d-eede-adbe-eff0-baadf00dd00d"/>
+              <SegmentTemplate timescale="1000" duration="8342" initialization="$RepresentationID$/init.mp4" media="$RepresentationID$/seg-$Number$.m4s" startNumber="1"/>
+              <Representation id="video/avc1" codecs="avc1.64001E" width="640" height="360" scanType="progressive" frameRate="30000/1001" bandwidth="347819"/>
+            </AdaptationSet>
+          </Period>
+        </MPD>
+        """
+        try mpd.write(to: dir.appendingPathComponent("stream.mpd"), atomically: true, encoding: .utf8)
+
+        let channel = Channel(name: "内置演示",
+                              url: dir.appendingPathComponent("stream.mpd").absoluteString,
+                              manifestType: .dash,
+                              licenseType: "clearkey",
+                              keys: [kid: key])
+        let playback = try DashPlayback(channel: channel)
+        defer { playback.stop() }
+
+        let localURL = try await playback.start()
+        let result = await play(url: localURL, seconds: 5)
+        NSLog("[Aurora][TEST] offline dash status=%d size=%dx%d frames=%d error=%@",
+              result.status, result.width, result.height, result.frames, result.error)
+
+        XCTAssertEqual(result.status, AVPlayerItem.Status.readyToPlay.rawValue, "DASH 转本地 HLS 未就绪：\(result.error)")
+        XCTAssertEqual(result.width, 640)
+        XCTAssertEqual(result.height, 360)
+        XCTAssertGreaterThanOrEqual(result.frames, 3, "DASH 本地 HLS 没有解出画面帧")
     }
 }

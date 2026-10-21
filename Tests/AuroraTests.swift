@@ -4,6 +4,27 @@ import CryptoKit
 
 final class AuroraTests: XCTestCase {
 
+    // MARK: - 内置演示
+
+    func testBundledDemoOfflineClearKeyChannel() throws {
+        let url = try XCTUnwrap(Bundle.main.url(forResource: "demo", withExtension: "m3u"),
+                                "App 包内缺少 demo.m3u")
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let channels = PlaylistParser.parse(text)
+        let demo = try XCTUnwrap(channels.first { $0.url.hasPrefix("aurora-bundle://") })
+
+        XCTAssertTrue(demo.isDASH)
+        XCTAssertTrue(demo.hasClearKey)
+        XCTAssertTrue(demo.url.hasSuffix("/demo-dash/stream.mpd"))
+        XCTAssertEqual(demo.keys["feedf00deedeadbeeff0baadf00dd00d"], "00112233445566778899aabbccddeeff")
+
+        let folder = try XCTUnwrap(Bundle.main.resourceURL?.appendingPathComponent("demo-dash"))
+        for relative in ["stream.mpd", "video/avc1/init.mp4", "video/avc1/seg-1.m4s", "video/avc1/seg-2.m4s"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent(relative).path),
+                          "内置演示缺少 \(relative)")
+        }
+    }
+
     // MARK: - 播放列表解析
 
     func testM3UParsing() {

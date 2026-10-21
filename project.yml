@@ -25,7 +25,11 @@ targets:
       - path: AuroraPlayer
         excludes:
           - "Resources/demo.m3u"
+          - "Resources/demo-dash"
       - path: AuroraPlayer/Resources/demo.m3u
+        buildPhase: resources
+      - path: AuroraPlayer/Resources/demo-dash
+        type: folder
         buildPhase: resources
     settings:
       base:

@@ -111,10 +111,35 @@ enum HTTPService {
         return decode(response.data)
     }
 
+    /// 内置资源：file:// 直接读磁盘，aurora-bundle://xxx/yyy 读 App 包内 demo-dash 等目录。
+    /// 这样内置演示流完全离线，不依赖任何域名是否可达。
+    private static func localResponse(for url: URL) throws -> Response? {
+        switch url.scheme?.lowercased() {
+        case "file":
+            guard let data = try? Data(contentsOf: url) else {
+                throw Failure.transport("无法读取本地文件")
+            }
+            return Response(data: data, status: 200, headers: [:], finalURL: url)
+        case "aurora-bundle":
+            guard let base = Bundle.main.resourceURL else {
+                throw Failure.transport("App 资源目录不可用")
+            }
+            let relative = (url.host ?? "") + url.path
+            let fileURL = base.appendingPathComponent(relative)
+            guard let data = try? Data(contentsOf: fileURL) else {
+                throw Failure.transport("内置资源缺失：\(relative)")
+            }
+            return Response(data: data, status: 200, headers: [:], finalURL: url)
+        default:
+            return nil
+        }
+    }
+
     static func fetch(_ urlString: String,
                       headers: [String: String] = [:],
                       range: (Int, Int)? = nil) async throws -> Response {
         guard let url = URL(string: urlString) else { throw Failure.badURL }
+        if let local = try localResponse(for: url) { return local }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
         request.setValue(defaultUserAgent, forHTTPHeaderField: "User-Agent")
