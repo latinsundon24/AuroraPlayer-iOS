@@ -177,14 +177,15 @@ final class DASHStream {
             if entry.t > 0 { current = entry.t }
             let repeatCount = entry.r >= 0 ? entry.r + 1 : 1
             if entry.r < 0 {
-                // r = -1：重复到 Period 结束
+                // r = -1：一直重复到 Period 结束；直播清单没有总时长时，先展开一段足够长的窗口
                 var t = current
                 var guardCount = 0
-                while (periodEnd <= 0 || t + entry.d <= periodEnd) && guardCount < 5000 {
+                let cap = periodEnd > 0 ? 20000 : 600
+                while guardCount < cap {
+                    if periodEnd > 0 && t + entry.d > periodEnd { break }
                     out.append((t, entry.d))
                     t += entry.d
                     guardCount += 1
-                    if periodEnd <= 0 { break }
                 }
                 current = t
             } else {

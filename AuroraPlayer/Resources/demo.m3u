@@ -11,3 +11,10 @@ https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tear
 
 #EXTINF:-1 group-title="示例" tvg-name="Apple BipBop",Apple BipBop
 https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8
+
+#EXTINF:-1 group-title="??" tvg-name="ClearKey DASH",ClearKey DASH ??
+#KODIPROP:inputstream.adaptive.manifest_type=mpd
+#KODIPROP:inputstream.adaptive.license_type=clearkey
+#KODIPROP:inputstream.adaptive.license_key=feedf00d-eede-adbe-eff0-baadf00dd00d:00112233445566778899aabbccddeeff
+#EXTVLCOPT:http-user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1
+https://raw.githubusercontent.com/latinsundon24/AuroraPlayer-iOS/main/demo-dash/stream.mpd
