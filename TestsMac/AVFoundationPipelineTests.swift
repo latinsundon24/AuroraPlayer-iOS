@@ -1,8 +1,10 @@
 import XCTest
 import AVFoundation
+import QuartzCore
+import CoreVideo
 
-/// 用 AVFoundation 真正加载并解码我们生成的 HLS（解密 + 去信令 + fMP4），
-/// 验证的不是“VLC 能播”，而是 Apple 自己的解析器能不能吃。
+/// 用 AVFoundation 真正起播我们生成的 HLS（解密 + 去信令 + fMP4），
+/// 并抓取解码后的像素帧——验证 Apple 的解码链路能不能吃。
 final class AVFoundationPipelineTests: XCTestCase {
 
     private var server: LocalHTTPServer?
@@ -92,10 +94,9 @@ final class AVFoundationPipelineTests: XCTestCase {
         return box
     }
 
-    private func mediaPlaylist(_ tag: String, durations: [Double], extraTags: String = "") -> String {
-        var text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
-        if !extraTags.isEmpty { text += extraTags + "\n" }
-        text += "#EXT-X-MAP:URI=\"\(tag)-init.mp4\"\n"
+    private func mediaPlaylist(_ tag: String, durations: [Double]) -> String {
+        var text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        text += "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(tag)-init.mp4\"\n"
         for (index, duration) in durations.enumerated() {
             text += "#EXTINF:\(String(format: "%.3f", duration)),\n\(tag)-n\(index + 1).m4s\n"
         }
@@ -103,16 +104,10 @@ final class AVFoundationPipelineTests: XCTestCase {
         return text
     }
 
-    private func masterPlaylist(_ tag: String, codecs: Bool = true, independent: Bool = true) -> String {
-        var text = "#EXTM3U\n#EXT-X-VERSION:7\n"
-        if independent { text += "#EXT-X-INDEPENDENT-SEGMENTS\n" }
-        if codecs {
-            text += "#EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS=\"avc1.64001E\",RESOLUTION=640x360\n"
-        } else {
-            text += "#EXT-X-STREAM-INF:BANDWIDTH=347819,RESOLUTION=640x360\n"
-        }
-        text += "\(tag)-v.m3u8\n"
-        return text
+    private func masterPlaylist(_ tag: String) -> String {
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=347819,CODECS=\"avc1.64001E\",RESOLUTION=640x360\n"
+            + "\(tag)-v.m3u8\n"
     }
 
     private func startServer(files: [String: Data]) throws -> UInt16 {
@@ -138,63 +133,71 @@ final class AVFoundationPipelineTests: XCTestCase {
         return server.port
     }
 
-    private func probe(port: UInt16, path: String, label: String) async -> String {
-        let url = URL(string: "http://127.0.0.1:\(port)/\(path)")!
-        let asset = AVURLAsset(url: url)
-        do {
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            let duration = try await asset.load(.duration)
-            return "\(label): tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
-        } catch {
-            return "\(label): error \(error)"
+    /// 真起播：等 readyToPlay，抓解码帧
+    private func play(url: URL, label: String, seconds: Double = 6) async -> String {
+        let item = AVPlayerItem(url: url)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
+        item.add(output)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        player.play()
+
+        var frames = 0
+        var firstFrameSize = CGSize.zero
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            let time = output.itemTime(forHostTime: CACurrentMediaTime())
+            if output.hasNewPixelBuffer(forItemTime: time),
+               let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
+                frames += 1
+                if firstFrameSize == .zero {
+                    firstFrameSize = CGSize(width: CVPixelBufferGetWidth(buffer),
+                                            height: CVPixelBufferGetHeight(buffer))
+                }
+            }
         }
+        player.pause()
+
+        let duration = item.duration.seconds
+        let size = item.presentationSize
+        let error = item.error.map { "\($0)" } ?? "nil"
+        return "\(label): status=\(item.status.rawValue) itemTracks=\(item.tracks.count)"
+            + " size=\(Int(size.width))x\(Int(size.height))"
+            + " frames=\(frames) frameSize=\(Int(firstFrameSize.width))x\(Int(firstFrameSize.height))"
+            + " duration=\(String(format: "%.2f", duration.isFinite ? duration : -1)) error=\(error)"
     }
 
     // MARK: - 诊断
 
-    func testDiagnoseContainerVariants() async throws {
+    func testPlaybackVariants() async throws {
         let pieces = try makePieces()
         let durations = [8.342, 5.005]
         var files: [String: Data] = [:]
 
-        struct Variant {
-            var tag: String
-            var initSegment: Data
-            var segments: [Data]
-            var master: Bool
-            var codecs: Bool = true
-            var independent: Bool = true
-            var extraTags: String = ""
-        }
-
-        let variants: [Variant] = [
-            Variant(tag: "base", initSegment: pieces.initSegment, segments: pieces.segments, master: true),
-            Variant(tag: "direct", initSegment: pieces.initSegment, segments: pieces.segments, master: false),
-            Variant(tag: "nocodecs", initSegment: pieces.initSegment, segments: pieces.segments, master: true, codecs: false),
-            Variant(tag: "noindep", initSegment: pieces.initSegment, segments: pieces.segments, master: true, independent: false),
-            Variant(tag: "iso6styp", initSegment: withBrand(pieces.initSegment, "iso6"),
-                    segments: pieces.segments.map(withStyp), master: true),
-            Variant(tag: "plain", initSegment: pieces.initSegment, segments: pieces.segments, master: true,
-                    extraTags: "#EXT-X-DISCONTINUITY-SEQUENCE:0")
+        let variants: [(String, Data, [Data])] = [
+            ("base", pieces.initSegment, pieces.segments),
+            ("iso6styp", withBrand(pieces.initSegment, "iso6"), pieces.segments.map(withStyp))
         ]
 
-        for variant in variants {
-            files["\(variant.tag)-init.mp4"] = variant.initSegment
-            for (index, segment) in variant.segments.enumerated() {
-                files["\(variant.tag)-n\(index + 1).m4s"] = segment
+        for (tag, initSegment, segments) in variants {
+            files["\(tag)-init.mp4"] = initSegment
+            for (index, segment) in segments.enumerated() {
+                files["\(tag)-n\(index + 1).m4s"] = segment
             }
-            files["\(variant.tag)-v.m3u8"] = Data(mediaPlaylist(variant.tag, durations: durations,
-                                                               extraTags: variant.extraTags).utf8)
-            files["\(variant.tag)-master.m3u8"] = Data(masterPlaylist(variant.tag, codecs: variant.codecs,
-                                                                      independent: variant.independent).utf8)
+            files["\(tag)-v.m3u8"] = Data(mediaPlaylist(tag, durations: durations).utf8)
+            files["\(tag)-master.m3u8"] = Data(masterPlaylist(tag).utf8)
         }
 
         let port = try startServer(files: files)
         var results: [String] = []
-        for variant in variants {
+
+        for (tag, _, _) in variants {
             _ = log.drain()
-            let path = variant.master ? "\(variant.tag)-master.m3u8" : "\(variant.tag)-v.m3u8"
-            let result = await probe(port: port, path: path, label: variant.tag)
+            let url = URL(string: "http://127.0.0.1:\(port)/\(tag)-master.m3u8")!
+            let result = await play(url: url, label: "hls-\(tag)")
             results.append(result)
             NSLog("[Aurora][DIAG] %@", result)
             for entry in log.drain() {
@@ -202,23 +205,18 @@ final class AVFoundationPipelineTests: XCTestCase {
             }
         }
 
+        // 整段 fMP4 当本地文件播（确认容器/解码本身没问题）
         let combined = pieces.initSegment + pieces.segments.reduce(Data(), +)
         let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("aurora-full-fmp4.mp4")
         try combined.write(to: fileURL)
-        do {
-            let fileAsset = AVURLAsset(url: fileURL)
-            let tracks = try await fileAsset.loadTracks(withMediaType: .video)
-            let duration = try await fileAsset.load(.duration)
-            let line = "file-fmp4: tracks=\(tracks.count) duration=\(String(format: "%.2f", duration.seconds))"
-            results.append(line)
-            NSLog("[Aurora][DIAG] %@", line)
-        } catch {
-            let line = "file-fmp4: error \(error)"
-            results.append(line)
-            NSLog("[Aurora][DIAG] %@", line)
-        }
+        _ = log.drain()
+        let fileResult = await play(url: fileURL, label: "file-fmp4")
+        results.append(fileResult)
+        NSLog("[Aurora][DIAG] %@", fileResult)
 
-        XCTAssertTrue(results.contains { $0.contains("tracks=1") },
-                      "没有任何封装形态被 AVFoundation 接受：\n" + results.joined(separator: "\n"))
+        XCTAssertTrue(results.contains { $0.hasPrefix("file-fmp4") && $0.contains("frames=") && !$0.contains("frames=0") },
+                      "本地 fMP4 都解不出帧：\n" + results.joined(separator: "\n"))
+        XCTAssertTrue(results.contains { $0.hasPrefix("hls-base") && !$0.contains("frames=0") },
+                      "本地 fMP4 能解，但 HLS 封装解不出帧：\n" + results.joined(separator: "\n"))
     }
 }
