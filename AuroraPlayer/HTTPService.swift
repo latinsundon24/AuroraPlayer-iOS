@@ -6,6 +6,22 @@ enum HTTPService {
     static let defaultUserAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
 
+    /// 直播源大量使用自签 / 过期 / 域名不匹配的证书。这里统一放行，
+    /// 否则 URLSession（MPD、分片、列表）会直接失败；AVPlayer 的直连由 HLSProxy 兜底。
+    final class InsecureTrustDelegate: NSObject, URLSessionDelegate {
+        func urlSession(_ session: URLSession,
+                        didReceive challenge: URLAuthenticationChallenge,
+                        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+            guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+                  let trust = challenge.protectionSpace.serverTrust else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            NSLog("[Aurora] TLS: 放行证书 %@", challenge.protectionSpace.host)
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        }
+    }
+
     struct Response {
         let data: Data
         let status: Int
@@ -27,24 +43,55 @@ enum HTTPService {
         }
     }
 
+    private static let trustDelegate = InsecureTrustDelegate()
+
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 60
         config.httpMaximumConnectionsPerHost = 8
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: config)
+        return URLSession(configuration: config, delegate: trustDelegate, delegateQueue: nil)
     }()
 
-    /// 同步拉文本（在后台线程调用）
-    static func fetchSync(_ urlString: String, headers: [String: String] = [:]) throws -> String {
+    /// 证书 / TLS 类错误（用于触发本地代理重试）
+    static func isCertificateError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorSecureConnectionFailed,
+                 NSURLErrorServerCertificateHasBadDate,
+                 NSURLErrorServerCertificateUntrusted,
+                 NSURLErrorServerCertificateHasUnknownRoot,
+                 NSURLErrorServerCertificateNotYetValid,
+                 NSURLErrorClientCertificateRejected,
+                 NSURLErrorClientCertificateRequired,
+                 -9802, -9813, -9814:
+                return true
+            default:
+                break
+            }
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isCertificateError(underlying)
+        }
+        return false
+    }
+
+    static func isCertificateError(_ error: Error?) -> Bool {
+        guard let error else { return false }
+        return isCertificateError(error)
+    }
+
+    /// 同步拉数据（在后台线程调用）
+    static func fetchSyncData(_ urlString: String, headers: [String: String] = [:]) throws -> Response {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<String, Error>!
+        var result: Result<Response, Error>!
 
         Task {
             do {
-                let text = try await fetchText(urlString, headers: headers)
-                result = .success(text)
+                let response = try await fetch(urlString, headers: headers)
+                result = .success(response)
             } catch {
                 result = .failure(error)
             }
@@ -52,6 +99,11 @@ enum HTTPService {
         }
         semaphore.wait()
         return try result.get()
+    }
+
+    /// 同步拉文本（在后台线程调用）
+    static func fetchSync(_ urlString: String, headers: [String: String] = [:]) throws -> String {
+        try decode(fetchSyncData(urlString, headers: headers).data)
     }
 
     static func fetchText(_ urlString: String, headers: [String: String] = [:]) async throws -> String {

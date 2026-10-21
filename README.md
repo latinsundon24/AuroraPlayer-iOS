@@ -49,6 +49,13 @@ CI 每次构建都会先跑单测（M3U 标签解析、MPD/分片展开、ClearK
 文件托管在 `demo-dash/`（KID `feedf00d-eede-adbe-eff0-baadf00dd00d`，
 KEY `00112233445566778899aabbccddeeff`），可用于端到端验证。
 
+## HTTPS 证书处理
+
+直播源常见自签、过期、域名不匹配证书，处理分两层：
+
+- App 自身的网络层（MPD / 分片 / 列表 / 代理）统一放行不受信任证书（控制台会打印 `[Aurora] TLS: 放行证书 …`）。
+- HLS 直连 AVPlayer 时，若因证书/安全连接失败，会自动切到本地代理：播放列表被重写为 `127.0.0.1` 地址，由 App 取流并补齐 UA / Referer，AVPlayer 只访问回环 HTTP。
+
 ## 已知限制
 
 - 只支持 ClearKey，不支持 Widevine / PlayReady / FairPlay。

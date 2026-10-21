@@ -26,6 +26,9 @@ final class AVPlayerEngine: ObservableObject {
     private var failObserver: NSObjectProtocol?
     private var rate: Float = 1.0
     private var dash: DashPlayback?
+    private var hlsProxy: HLSProxy?
+    private var currentChannel: Channel?
+    private var proxyAttempted = false
     /// 用户是否希望播放（DASH 准备完成后据此自动起播）
     private var wantsPlayback = false
     private var openToken = UUID()
@@ -69,6 +72,8 @@ final class AVPlayerEngine: ObservableObject {
 
     func open(_ channel: Channel) {
         stopCurrent()
+        currentChannel = channel
+        proxyAttempted = false
         let token = UUID()
         openToken = token
         errorMessage = nil
@@ -109,6 +114,9 @@ final class AVPlayerEngine: ObservableObject {
 
     func stopCurrent() {
         openToken = UUID()
+        hlsProxy?.stop()
+        hlsProxy = nil
+        proxyAttempted = false
         dash?.stop()
         dash = nil
         pause()
@@ -167,6 +175,7 @@ final class AVPlayerEngine: ObservableObject {
 
     /// 把 AVFoundation 的原始错误暴露出来，便于定位（例如 ATS 拦截、分片 4xx/5xx）
     private func report(item: AVPlayerItem) {
+        guard item === player.currentItem else { return }
         let ns = item.error as NSError?
         var detail = ns?.localizedDescription ?? "无法播放该流（格式不支持或网络异常）"
         if let ns {
@@ -183,6 +192,29 @@ final class AVPlayerEngine: ObservableObject {
         }
         NSLog("[Aurora] AVPlayerItem failed: %@", String(describing: ns))
         if errorMessage != detail { errorMessage = detail }
+        retryWithProxyIfNeeded(error: ns)
+    }
+
+    /// AVPlayer 自己无法放行异常证书：https 直连失败时改走本地代理，用 URLSession 取流。
+    private func retryWithProxyIfNeeded(error: NSError?) {
+        guard !proxyAttempted,
+              let channel = currentChannel,
+              !channel.isDASH else { return }
+        if let error {
+            let domain = error.domain
+            let cert = HTTPService.isCertificateError(error)
+            guard cert || domain == NSURLErrorDomain || domain == "CoreMediaErrorDomain" else { return }
+        }
+        proxyAttempted = true
+        do {
+            let proxy = try HLSProxy(channel: channel)
+            hlsProxy = proxy
+            errorMessage = nil
+            NSLog("[Aurora] 改用 HLS 代理重试: %@", channel.url)
+            load(url: proxy.entryURL, headers: [:])
+        } catch {
+            errorMessage = "代理启动失败：\(error.localizedDescription)"
+        }
     }
 
     func play() {

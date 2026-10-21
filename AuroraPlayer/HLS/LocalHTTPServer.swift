@@ -122,7 +122,7 @@ final class LocalHTTPServer {
         var payload = body
         var finalStatus = status
 
-        if status == 200, let rangeHeader, path.hasSuffix(".m4s") || path.hasSuffix(".mp4") {
+        if status == 200, let rangeHeader, !body.isEmpty {
             let field = rangeHeader.dropFirst(6).trimmingCharacters(in: .whitespaces)
             let pieces = field.hasPrefix("bytes=") ? field.dropFirst(6).split(separator: "-", omittingEmptySubsequences: false) : []
             let total = body.count
