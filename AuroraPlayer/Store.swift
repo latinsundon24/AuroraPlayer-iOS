@@ -11,10 +11,13 @@ final class Store: ObservableObject {
     private let defaults = UserDefaults.standard
     private let sourcesKey = "aurora.sources"
     private let channelsPrefix = "aurora.channels."
+    private let demoVersionKey = "aurora.demoVersion"
+    /// 内置示例的内容版本：升级后把老用户的内置线路也换成新的（例如离线 ClearKey 演示）
+    private let demoVersion = 2
 
     private init() {
         load()
-        seedIfEmpty()
+        seedIfNeeded()
     }
 
     // MARK: - sources
@@ -69,18 +72,29 @@ final class Store: ObservableObject {
 
     // MARK: - 内置示例
 
-    private func seedIfEmpty() {
-        guard sources.isEmpty else { return }
+    private func seedIfNeeded() {
+        guard defaults.integer(forKey: demoVersionKey) < demoVersion else { return }
         guard let url = Bundle.main.url(forResource: "demo", withExtension: "m3u"),
               let data = try? Data(contentsOf: url) else {
             return
         }
         let channels = PlaylistParser.parse(HTTPService.decode(data))
         guard !channels.isEmpty else { return }
-        var source = Source(name: "内置示例线路", kind: .asset, location: "demo.m3u")
-        source.count = channels.count
-        save(channels: channels, for: source)
-        sources = [source]
-        persist()
+
+        if let index = sources.firstIndex(where: { $0.kind == .asset && $0.location == "demo.m3u" }) {
+            // 老版本安装过：原地更新内置线路内容（用户自己的线路不受影响）
+            var source = sources[index]
+            save(channels: channels, for: source)
+            source.count = channels.count
+            sources[index] = source
+            persist()
+        } else if sources.isEmpty {
+            var source = Source(name: "内置示例线路", kind: .asset, location: "demo.m3u")
+            source.count = channels.count
+            save(channels: channels, for: source)
+            sources = [source]
+            persist()
+        }
+        defaults.set(demoVersion, forKey: demoVersionKey)
     }
 }
