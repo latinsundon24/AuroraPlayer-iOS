@@ -46,6 +46,8 @@ final class DashPlayback {
     private var droppedAudio = 0
     private var lastNumberVideo = -1
     private var lastNumberAudio = -1
+    private var lastTimeVideo: Double = -1
+    private var lastTimeAudio: Double = -1
 
     private var cache: [String: Data] = [:]
     private var cacheOrder: [String] = []
@@ -85,6 +87,11 @@ final class DashPlayback {
         audioStream = audio
         guard video != nil || audio != nil else { throw Failure.noStream }
 
+        // 有些 MPD 只在 <MPD> 上声明总时长
+        if period.duration == nil, let total = doc.mediaPresentationDuration {
+            period.duration = max(0, total - (period.start ?? 0))
+        }
+
         if keys.isEmpty, let license = channel.licenseURL {
             await loadRemoteKeys(license)
         }
@@ -106,12 +113,28 @@ final class DashPlayback {
             }
         }
 
+        if (encryptedVideo || encryptedAudio) && keys.isEmpty {
+            throw Failure.unsupported("该 DASH 流已加密，但播放列表没有提供 ClearKey（license_key）")
+        }
+
         if doc.isDynamic {
-            refreshWindow(doc: doc, period: period, initial: true)
+            refreshWindow(doc: doc, period: period, initial: true)            // 等直播窗口里至少有 2 个分片，避免 AVPlayer 拿到空清单
+            var waited = 0
+            while waited < 20, currentWindowCount() < 2 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                waited += 1
+                if let fresh = try? await fetchDocument() {
+                    document = fresh
+                    if let freshPeriod = fresh.periods.first {
+                        refreshWindow(doc: fresh, period: freshPeriod, initial: false)
+                    }
+                }
+            }
             startLiveLoop()
         } else {
             loadStaticSegments(period: period)
         }
+        prefetchLatest()
 
         let server = try LocalHTTPServer { [weak self] path, range in
             guard let self else { return (404, "text/plain", Data()) }
@@ -281,13 +304,15 @@ final class DashPlayback {
         defer { lock.unlock() }
         if let video = videoStream {
             windowVideo = video.staticSegments()
-            mapVideo = Dictionary(uniqueKeysWithValues: windowVideo.map { ("v\($0.number).m4s", $0) })
+            mapVideo = Dictionary(uniqueKeysWithValues: windowVideo.map { ("v\($0.key).m4s", $0) })
             lastNumberVideo = windowVideo.last?.number ?? -1
+            lastTimeVideo = windowVideo.last?.time ?? -1
         }
         if let audio = audioStream {
             windowAudio = audio.staticSegments()
-            mapAudio = Dictionary(uniqueKeysWithValues: windowAudio.map { ("a\($0.number).m4s", $0) })
+            mapAudio = Dictionary(uniqueKeysWithValues: windowAudio.map { ("a\($0.key).m4s", $0) })
             lastNumberAudio = windowAudio.last?.number ?? -1
+            lastTimeAudio = windowAudio.last?.time ?? -1
         }
     }
 
@@ -301,48 +326,83 @@ final class DashPlayback {
                                               availabilityStart: doc.availabilityStartTime,
                                               timeShiftBuffer: doc.timeShiftBufferDepth)
             append(segments, to: &windowVideo, map: &mapVideo,
-                   lastNumber: &lastNumberVideo, dropped: &droppedVideo, kind: "v", initial: initial)
+                   lastTime: &lastTimeVideo, dropped: &droppedVideo, kind: "v", initial: initial)
         }
         if let audio = audioStream {
             let segments = audio.liveSegments(now: now,
                                               availabilityStart: doc.availabilityStartTime,
                                               timeShiftBuffer: doc.timeShiftBufferDepth)
             append(segments, to: &windowAudio, map: &mapAudio,
-                   lastNumber: &lastNumberAudio, dropped: &droppedAudio, kind: "a", initial: initial)
+                   lastTime: &lastTimeAudio, dropped: &droppedAudio, kind: "a", initial: initial)
         }
     }
 
     private func append(_ segments: [DASHStream.Segment],
                         to window: inout [DASHStream.Segment],
                         map: inout [String: DASHStream.Segment],
-                        lastNumber: inout Int,
+                        lastTime: inout Double,
                         dropped: inout Int,
                         kind: String,
                         initial: Bool) {
+        // 以“呈现时间”去重：时间线滑动时 number 可能整体平移，time 不会
         let keep = 12
         var merged = window
         if initial || merged.isEmpty {
             merged = segments
         } else {
-            for segment in segments where segment.number > lastNumber {
+            for segment in segments where segment.time > lastTime + 0.001 {
                 merged.append(segment)
             }
         }
-        if let last = merged.last { lastNumber = max(lastNumber, last.number) }
+        if let last = merged.last { lastTime = max(lastTime, last.time) }
+
+        // 去重（同一 time 只留一个）
+        var seen = Set<String>()
+        merged = merged.filter { seen.insert($0.key).inserted }
+
         if merged.count > keep {
             let removeCount = merged.count - keep
             dropped += removeCount
             merged.removeFirst(removeCount)
         }
         for segment in merged {
-            map["\(kind)\(segment.number).m4s"] = segment
+            map["\(kind)\(segment.key).m4s"] = segment
         }
         // 只保留最近的映射，避免无界增长
-        if map.count > 64 {
-            let sorted = map.sorted { $0.value.number < $1.value.number }
-            for item in sorted.prefix(map.count - 64) { map.removeValue(forKey: item.key) }
+        if map.count > 96 {
+            let sorted = map.sorted { $0.value.time < $1.value.time }
+            for item in sorted.prefix(map.count - 96) { map.removeValue(forKey: item.key) }
         }
         window = merged
+    }
+
+    private func currentWindowCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return max(windowVideo.count, windowAudio.count)
+    }
+
+    private func prefetchLatest() {
+        lock.lock()
+        let videoSegment = windowVideo.last
+        let audioSegment = windowAudio.last
+        lock.unlock()
+
+        if let videoSegment, cachedSegment("v\(videoSegment.key).m4s") == nil {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.loadSegment(videoSegment, kind: "v", prefetch: false)
+            }
+        }
+        if let audioSegment, cachedSegment("a\(audioSegment.key).m4s") == nil {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.loadSegment(audioSegment, kind: "a", prefetch: false)
+            }
+        }
+    }
+
+    private func fetchDocument() async throws -> MPDDocument? {
+        let response = try await HTTPService.fetch(channel.url, headers: channel.headers)
+        return MPDParser.parse(data: response.data)
     }
 
     private func startLiveLoop() {
@@ -357,6 +417,7 @@ final class DashPlayback {
                     if let fresh = MPDParser.parse(data: response.data), !fresh.periods.isEmpty {
                         self.document = fresh
                         self.refreshWindow(doc: fresh, period: fresh.periods.first ?? period, initial: false)
+                        self.prefetchLatest()
                     }
                 } catch {
                     // 直播刷新失败不致命，下一轮再试
@@ -467,7 +528,7 @@ final class DashPlayback {
         text += "#EXT-X-MAP:URI=\"\(initName)\"\n"
         for segment in window {
             text += "#EXTINF:\(String(format: "%.3f", segment.duration)),\n"
-            text += "\(kind)\(segment.number).m4s\n"
+            text += "\(kind)\(segment.key).m4s\n"
         }
         if !live {
             text += "#EXT-X-ENDLIST\n"
@@ -477,8 +538,8 @@ final class DashPlayback {
 
     // MARK: - 分片下载 / 解密
 
-    private func loadSegment(_ segment: DASHStream.Segment, kind: String) -> Data? {
-        let name = "\(kind)\(segment.number).m4s"
+    private func loadSegment(_ segment: DASHStream.Segment, kind: String, prefetch: Bool = true) -> Data? {
+        let name = "\(kind)\(segment.key).m4s"
         if let cached = cachedSegment(name) { return cached }
         if stopped { return nil }
 
@@ -492,7 +553,8 @@ final class DashPlayback {
             let info = isAudio ? infoAudio : infoVideo
             do {
                 let track = MP4Fragment.parse(raw, defaults: info)
-                output = try CENC.decrypt(fragment: raw, track: track, info: info, keys: keys)
+                let decrypted = try CENC.decrypt(fragment: raw, track: track, info: info, keys: keys)
+                output = MP4Fragment.stripAuxiliaryBoxes(decrypted)
             } catch {
                 NSLog("[Aurora] decrypt failed %@: %@", name, String(describing: error))
                 return nil
@@ -500,7 +562,23 @@ final class DashPlayback {
         }
 
         store(name: name, data: output)
+        if prefetch { prefetchNext(after: segment, kind: kind) }
         return output
+    }
+
+    /// 预取后面 2 个分片，减少起播/连续播放卡顿
+    private func prefetchNext(after segment: DASHStream.Segment, kind: String) {
+        lock.lock()
+        let window = kind == "a" ? windowAudio : windowVideo
+        lock.unlock()
+        guard let index = window.firstIndex(where: { $0.key == segment.key }) else { return }
+        for next in window.dropFirst(index + 1).prefix(2) {
+            let name = "\(kind)\(next.key).m4s"
+            if cachedSegment(name) != nil { continue }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                _ = self?.loadSegment(next, kind: kind, prefetch: false)
+            }
+        }
     }
 
     private func syncFetch(_ url: URL, attempts: Int) -> Data? {

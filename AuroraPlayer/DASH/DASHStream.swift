@@ -51,7 +51,8 @@ final class DASHStream {
         let duration: Double
         let time: Double
         let number: Int
-        var name: String { "\(number)" }
+        /// 稳定标识：直播时间线滑动时命名不会变
+        let key: String
     }
 
     /// 计算静态（点播）清单的全部分片
@@ -64,7 +65,8 @@ final class DASHStream {
                 return Segment(url: url,
                                duration: dur,
                                time: Double(index) * dur,
-                               number: index + 1)
+                               number: index + 1,
+                               key: "i\(index)")
             }
         }
         guard let template = template else { return [] }
@@ -78,7 +80,8 @@ final class DASHStream {
                 let number = template.startNumber + position
                 let urlString = expand(template.media ?? "", number: number, time: entry.t)
                 guard let url = resolve(urlString) else { continue }
-                out.append(Segment(url: url, duration: entry.d/ts, time: entry.t/ts, number: number))
+                out.append(Segment(url: url, duration: entry.d/ts, time: entry.t/ts, number: number,
+                                   key: "t\(Int64(entry.t))"))
             }
             return out
         }
@@ -91,7 +94,8 @@ final class DASHStream {
             let number = template.startNumber + i
             let urlString = expand(template.media ?? "", number: number, time: (template.pto + Double(i) * segDuration))
             guard let url = resolve(urlString) else { continue }
-            out.append(Segment(url: url, duration: segSeconds, time: Double(i) * segSeconds, number: number))
+            out.append(Segment(url: url, duration: segSeconds, time: Double(i) * segSeconds, number: number,
+                               key: "n\(number)"))
         }
         return out
     }
@@ -106,33 +110,43 @@ final class DASHStream {
         }
         let ts = template.timescale > 0 ? template.timescale : 1
         let periodStart = period.start ?? 0
-        let ast = availabilityStart ?? now
-        let elapsed = now.timeIntervalSince(ast) - periodStart
-        guard elapsed > 0 else { return [] }
-
-        // 当前可用的媒体时间（秒，相对 Period）
         let ptoSeconds = template.pto / ts
-        let liveEdge = elapsed - ptoSeconds
+
+        var mediaElapsed: Double?
+        if let ast = availabilityStart {
+            let value = now.timeIntervalSince(ast) - periodStart - ptoSeconds
+            if value > 0 { mediaElapsed = value }
+        }
+
+        func make(_ number: Int, _ rawTime: Double, _ rawDuration: Double, _ timeSeconds: Double) -> Segment? {
+            let urlString = expand(template.media ?? "", number: number, time: rawTime)
+            guard let url = resolve(urlString) else { return nil }
+            return Segment(url: url,
+                           duration: rawDuration / ts,
+                           time: timeSeconds,
+                           number: number,
+                           key: "t\(Int64(rawTime))")
+        }
 
         var candidates: [Segment] = []
 
         if !template.timeline.isEmpty {
-            let entries = expandedTimeline()
-            var position = 0
-            for entry in entries {
+            for (position, entry) in expandedTimeline().enumerated() {
                 let startSeconds = entry.t / ts - ptoSeconds
                 let endSeconds = startSeconds + entry.d / ts
                 let number = template.startNumber + position
-                position += 1
-                guard endSeconds <= liveEdge + 0.5 else { continue }
-                if let tsb = timeShiftBuffer, startSeconds < liveEdge - tsb { continue }
-                let urlString = expand(template.media ?? "", number: number, time: entry.t)
-                guard let url = resolve(urlString) else { continue }
-                candidates.append(Segment(url: url, duration: entry.d / ts, time: startSeconds, number: number))
+                if let edge = mediaElapsed {
+                    guard endSeconds <= edge + 0.5 else { continue }
+                    if let tsb = timeShiftBuffer, startSeconds < edge - tsb { continue }
+                }
+                if let segment = make(number, entry.t, entry.d, startSeconds) {
+                    candidates.append(segment)
+                }
             }
         } else if let segDuration = template.duration, segDuration > 0 {
+            guard let edge = mediaElapsed else { return [] }
             let segSeconds = segDuration / ts
-            let lastIndex = Int(floor(elapsed / segSeconds)) - 1
+            let lastIndex = Int(floor(edge / segSeconds)) - 1
             guard lastIndex >= 0 else { return [] }
             var firstIndex = 0
             if let tsb = timeShiftBuffer {
@@ -141,12 +155,12 @@ final class DASHStream {
             firstIndex = max(firstIndex, lastIndex - maxCount + 1)
             for i in firstIndex...lastIndex {
                 let number = template.startNumber + i
-                let urlString = expand(template.media ?? "", number: number, time: (template.pto + Double(i) * segDuration))
-                guard let url = resolve(urlString) else { continue }
-                candidates.append(Segment(url: url,
-                                          duration: segSeconds,
-                                          time: Double(i) * segSeconds,
-                                          number: number))
+                if let segment = make(number,
+                                      template.pto + Double(i) * segDuration,
+                                      segDuration,
+                                      Double(i) * segSeconds) {
+                    candidates.append(segment)
+                }
             }
         }
 

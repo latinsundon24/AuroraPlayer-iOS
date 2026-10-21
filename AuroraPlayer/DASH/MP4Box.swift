@@ -292,6 +292,73 @@ enum MP4Fragment {
         var crypto: [SampleCrypto] = []
     }
 
+    /// 去掉分片里的加密辅助盒子（senc/saiz/saio），并修正 trun.data_offset。
+    /// 解密后这些信息已经没有意义，AVFoundation 对残留信令更敏感。
+    static func stripAuxiliaryBoxes(_ fragment: Data) -> Data {
+        let bytes = [UInt8](fragment)
+        var out = Data()
+        var offset = 0
+        while offset + 8 <= bytes.count {
+            var size = Int(be32(bytes, offset))
+            let type = fourCC(bytes, offset + 4)
+            var header = 8
+            if size == 1 {
+                guard offset + 16 <= bytes.count else { break }
+                size = Int(be64(bytes, offset + 8))
+                header = 16
+            } else if size == 0 {
+                size = bytes.count - offset
+            }
+            guard size >= header, offset + size <= bytes.count else { break }
+            if type == "moof" {
+                out.append(cleanMoof(Data(bytes[offset..<(offset + size)])))
+            } else {
+                out.append(contentsOf: bytes[offset..<(offset + size)])
+            }
+            offset += size
+        }
+        return out.isEmpty ? fragment : out
+    }
+
+    private static func cleanMoof(_ moofData: Data) -> Data {
+        var boxes = Box.parse(moofData)
+        guard let moofIndex = boxes.firstIndex(where: { $0.type == "moof" }),
+              var children = boxes[moofIndex].children else { return moofData }
+
+        var removed = 0
+        for i in children.indices where children[i].type == "traf" {
+            guard var trafChildren = children[i].children else { continue }
+            let kept = trafChildren.filter { !["senc", "saiz", "saio"].contains($0.type) }
+            removed += trafChildren.reduce(0) { partial, box in
+                ["senc", "saiz", "saio"].contains(box.type) ? partial + 8 + box.payload.count : partial
+            }
+            trafChildren = kept
+            children[i].children = trafChildren
+        }
+        guard removed > 0 else { return moofData }
+
+        for i in children.indices where children[i].type == "traf" {
+            guard var trafChildren = children[i].children else { continue }
+            for j in trafChildren.indices where trafChildren[j].type == "trun" {
+                var payload = [UInt8](trafChildren[j].payload)
+                guard payload.count >= 12 else { continue }
+                let flags = be32(payload, 0) & 0x00FFFFFF
+                guard flags & 0x000001 != 0 else { continue }
+                let raw = be32(payload, 8)
+                let value = Int32(bitPattern: raw) - Int32(removed)
+                let fixed = UInt32(bitPattern: value)
+                payload[8] = UInt8((fixed >> 24) & 0xFF)
+                payload[9] = UInt8((fixed >> 16) & 0xFF)
+                payload[10] = UInt8((fixed >> 8) & 0xFF)
+                payload[11] = UInt8(fixed & 0xFF)
+                trafChildren[j].payload = Data(payload)
+            }
+            children[i].children = trafChildren
+        }
+        boxes[moofIndex].children = children
+        return Box.serialize(boxes)
+    }
+
     /// 解析一个媒体分片（moof + mdat）
     static func parse(_ data: Data,
                       defaults: MP4Crypto.InitInfo,
